@@ -141,10 +141,14 @@ The clipboard is a shared, briefly-locked OS resource, so `internal/app` takes a
 `copyToClipboard` function that tests replace — that way running the tests never
 overwrites your real clipboard.
 
-The race detector (`go test -race`) needs cgo and therefore a C compiler
-(`gcc`), which is not installed here. To use it:
-`winget install ezwinports.make`-style MinGW, or install TDM-GCC, then
-`$env:CGO_ENABLED=1; go test -race ./...`.
+The race detector (`go test -race`) needs cgo, and therefore a C compiler, which
+is not installed here (`CGO_ENABLED=0`). To enable it:
+
+```powershell
+winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e   # MinGW-w64, provides gcc
+$env:Path += ";C:\Program Files\WinLibs\...\bin"          # wherever it landed
+$env:CGO_ENABLED=1; go test -race ./...
+```
 
 ## Troubleshooting
 

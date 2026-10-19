@@ -61,10 +61,14 @@ type Tray struct {
 	mCopyLink  *systray.MenuItem
 	mQuit      *systray.MenuItem
 
-	// ready guards the menu item pointers: menu items only exist after
-	// systray.Run has called onReady, and Refresh may be called before that.
+	// mu guards ready: menu items and the icon only exist after systray.Run has
+	// called onReady, but Refresh and Quit may be called before that.
 	mu    sync.RWMutex
 	ready bool
+	// readyCh is closed the moment the tray becomes ready, so a caller that
+	// needs to act on the tray (rather than on its state) can wait for it.
+	readyCh   chan struct{}
+	readyOnce sync.Once
 }
 
 // New creates a Tray. Call Run to show it.
@@ -77,7 +81,13 @@ func New(opts Options) *Tray {
 	if title == "" {
 		title = "Streamy"
 	}
-	return &Tray{logger: logger, ctrl: opts.Controller, title: title, opts: opts}
+	return &Tray{
+		logger:  logger,
+		ctrl:    opts.Controller,
+		title:   title,
+		opts:    opts,
+		readyCh: make(chan struct{}),
+	}
 }
 
 // Run shows the tray icon and blocks until the user picks Quit or ctx is
@@ -90,13 +100,20 @@ func New(opts Options) *Tray {
 // hangs off, which makes shutdown ordering obvious.
 func (t *Tray) Run(ctx context.Context) error {
 	// A second goroutine watches for cancellation and tells the tray to close.
-	// systray.Quit is safe to call from any goroutine.
 	stopped := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
+			// systray.Quit() needs the tray window to exist, and it can only
+			// ever take effect once in the life of the process, so wait until
+			// the tray is up before asking it to close.
+			select {
+			case <-t.readyCh:
+			case <-stopped:
+				return
+			}
 			t.logger.Debug("context cancelled, closing tray")
-			systray.Quit()
+			t.Quit()
 		case <-stopped:
 		}
 	}()
@@ -107,7 +124,21 @@ func (t *Tray) Run(ctx context.Context) error {
 }
 
 // Quit asks the tray to close and Run to return.
-func (t *Tray) Quit() { systray.Quit() }
+func (t *Tray) Quit() {
+	t.mu.RLock()
+	ready := t.ready
+	t.mu.RUnlock()
+
+	if !ready {
+		// systray's quit() is wrapped in a sync.Once, so spending it before the
+		// tray exists would make the next — the real — Quit a silent no-op and
+		// leave the message loop running forever. Doing nothing here is the
+		// correct move: the run loop is not running yet either.
+		t.logger.Debug("tray quit requested before it was ready, ignoring")
+		return
+	}
+	systray.Quit()
+}
 
 // Notify shows a balloon notification next to the tray icon.
 func (t *Tray) Notify(title, message string) {
@@ -131,6 +162,7 @@ func (t *Tray) onReady() {
 	t.mu.Lock()
 	t.ready = true
 	t.mu.Unlock()
+	t.readyOnce.Do(func() { close(t.readyCh) })
 
 	go t.clickLoop()
 	t.Refresh()
