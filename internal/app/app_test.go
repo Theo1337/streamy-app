@@ -8,31 +8,32 @@ import (
 	"time"
 
 	"streamy/internal/config"
+	"streamy/internal/pipeline"
 )
 
 // fakeStreamer records what the app asked it to do, so the tests can check the
 // lifecycle without ffmpeg or a network. Implementing an interface is all it
-// takes to stand in for the real pipeline — that is the payoff for defining
-// Streamer as an interface back in phase 1.
+// takes to stand in for the real pipeline — that is the payoff for keeping the
+// pipeline behind pipeline.Streamer.
 type fakeStreamer struct {
 	mu       sync.Mutex
-	url      string
+	session  pipeline.Session
 	startErr error
 	stopErr  error
 	starts   int
 	stops    int
-	lastReq  StartRequest
+	lastReq  pipeline.Request
 }
 
-func (f *fakeStreamer) Start(_ context.Context, req StartRequest) (string, error) {
+func (f *fakeStreamer) Start(_ context.Context, req pipeline.Request) (pipeline.Session, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.starts++
 	f.lastReq = req
 	if f.startErr != nil {
-		return "", f.startErr
+		return pipeline.Session{}, f.startErr
 	}
-	return f.url, nil
+	return f.session, nil
 }
 
 func (f *fakeStreamer) Stop(context.Context) error {
@@ -48,9 +49,32 @@ func (f *fakeStreamer) counts() (starts, stops int) {
 	return f.starts, f.stops
 }
 
+// testViewerURL is what the fake pipeline hands back as a link.
+const testViewerURL = "https://viewer.example/?room=abc"
+
+// sharingSession is the session the fake reports by default.
+func sharingSession() pipeline.Session {
+	return pipeline.Session{
+		ViewerURL:   testViewerURL,
+		Label:       "Sharing",
+		Description: "Sharing monitor 0",
+	}
+}
+
+// recordingSession is a phase 2 style session: recording to a local file, with
+// the file's URL as the link.
+func recordingSession() pipeline.Session {
+	return pipeline.Session{
+		LocalRecording: `C:\Users\me\Videos\Streamy\streamy-2026-01-01_12-00-00.mp4`,
+		ViewerURL:      "file:///C:/Users/me/Videos/Streamy/streamy-2026-01-01_12-00-00.mp4",
+		Label:          "Recording",
+		Description:    "Recording monitor 2 to C:\\Users\\me\\Videos\\Streamy\\streamy-2026-01-01_12-00-00.mp4",
+	}
+}
+
 // newTestApp builds a headless app with a substituted clipboard so running the
 // tests never touches the developer's real clipboard.
-func newTestApp(t *testing.T, streamer Streamer) (*App, *[]string) {
+func newTestApp(t *testing.T, streamer pipeline.Streamer) (*App, *[]string) {
 	t.Helper()
 
 	var copied []string
@@ -73,8 +97,37 @@ func newTestApp(t *testing.T, streamer Streamer) (*App, *[]string) {
 	return a, &copied
 }
 
+// TestRecordingSessionWording checks the phase 2 path: the tray must say
+// "Recording", not "Sharing", when the pipeline is writing a file, and the link
+// it copies is the recording's own file URL.
+func TestRecordingSessionWording(t *testing.T) {
+	streamer := &fakeStreamer{session: recordingSession()}
+	a, copied := newTestApp(t, streamer)
+
+	a.ToggleSharing()
+
+	status := a.Status()
+	if !status.Sharing {
+		t.Fatalf("status = %+v, want active", status)
+	}
+	if status.Text != "Recording" {
+		t.Errorf("tray text = %q, want \"Recording\"", status.Text)
+	}
+	// The menu is built from this, so the user sees "Stop recording" rather
+	// than "Stop sharing".
+	if status.Active != "Recording" {
+		t.Errorf("tray Active = %q, want \"Recording\"", status.Active)
+	}
+	if status.ViewerURL != recordingSession().ViewerURL {
+		t.Errorf("viewer url = %q, want the recording's file URL", status.ViewerURL)
+	}
+	if len(*copied) != 1 || (*copied)[0] != recordingSession().ViewerURL {
+		t.Errorf("clipboard = %v, want the recording's file URL", *copied)
+	}
+}
+
 func TestToggleSharingStartAndStop(t *testing.T) {
-	streamer := &fakeStreamer{url: "https://viewer.example/?room=abc"}
+	streamer := &fakeStreamer{session: sharingSession()}
 	a, copied := newTestApp(t, streamer)
 
 	if got := a.Status(); got.Sharing || got.Text != StateIdle.String() {
@@ -87,11 +140,11 @@ func TestToggleSharingStartAndStop(t *testing.T) {
 	if !status.Sharing {
 		t.Fatalf("status after start = %+v, want sharing", status)
 	}
-	if status.ViewerURL != streamer.url {
-		t.Errorf("viewer url = %q, want %q", status.ViewerURL, streamer.url)
+	if status.ViewerURL != testViewerURL {
+		t.Errorf("viewer url = %q, want %q", status.ViewerURL, testViewerURL)
 	}
-	if len(*copied) != 1 || (*copied)[0] != streamer.url {
-		t.Errorf("clipboard = %v, want [%q]", *copied, streamer.url)
+	if len(*copied) != 1 || (*copied)[0] != testViewerURL {
+		t.Errorf("clipboard = %v, want [%q]", *copied, testViewerURL)
 	}
 
 	a.ToggleSharing()
@@ -110,7 +163,7 @@ func TestToggleSharingStartAndStop(t *testing.T) {
 // Phase 1 ships the stub, which refuses to start. The app must stay idle and not
 // pretend a stream is running.
 func TestNotImplementedStreamerLeavesAppIdle(t *testing.T) {
-	streamer := &fakeStreamer{startErr: ErrNotImplemented}
+	streamer := &fakeStreamer{startErr: pipeline.ErrNotImplemented}
 	a, copied := newTestApp(t, streamer)
 
 	a.ToggleSharing()
@@ -139,7 +192,7 @@ func TestStartFailureIsReportedAndRecoverable(t *testing.T) {
 	// A later attempt must be allowed: the failure did not wedge the state.
 	streamer.mu.Lock()
 	streamer.startErr = nil
-	streamer.url = "https://viewer.example/?room=retry"
+	streamer.session = pipeline.Session{ViewerURL: "https://viewer.example/?room=retry", Label: "Sharing"}
 	streamer.mu.Unlock()
 
 	a.ToggleSharing()
@@ -149,9 +202,8 @@ func TestStartFailureIsReportedAndRecoverable(t *testing.T) {
 }
 
 func TestCopyViewerLinkWithoutStream(t *testing.T) {
-	streamer := &fakeStreamer{url: "https://viewer.example/?room=abc"}
+	streamer := &fakeStreamer{session: sharingSession()}
 	a, copied := newTestApp(t, streamer)
-
 	a.CopyViewerLink()
 	if len(*copied) != 0 {
 		t.Errorf("clipboard = %v, want nothing copied while idle", *copied)
@@ -177,7 +229,7 @@ func TestQuitIsIdempotent(t *testing.T) {
 }
 
 func TestShutdownStopsAnActiveStream(t *testing.T) {
-	streamer := &fakeStreamer{url: "https://viewer.example/?room=abc"}
+	streamer := &fakeStreamer{session: sharingSession()}
 	a, _ := newTestApp(t, streamer)
 
 	a.ToggleSharing()
@@ -212,7 +264,7 @@ func TestStateString(t *testing.T) {
 // runs, the hotkey is registered, the context is cancelled and everything is
 // released again. This is the phase 1 "clean shutdown" requirement in test form.
 func TestRunShutsDownOnContextCancel(t *testing.T) {
-	streamer := &fakeStreamer{url: "https://viewer.example/?room=abc"}
+	streamer := &fakeStreamer{session: sharingSession()}
 	a, err := New(Options{
 		Config:          config.Default(), // hotkey enabled
 		Streamer:        streamer,

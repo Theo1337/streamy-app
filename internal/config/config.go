@@ -14,6 +14,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -217,6 +218,13 @@ func LoadFrom(path string) (cfg Config, created bool, err error) {
 	case err != nil:
 		return Config{}, false, fmt.Errorf("read config: %w", err)
 	}
+
+	// The file is meant to be hand editable, and a good few Windows tools still
+	// write a UTF-8 byte order mark at the start: PowerShell's Set-Content, and
+	// any editor set to "UTF-8 with BOM". JSON does not allow one, and the
+	// failure is nasty, because the settings look fine and are silently
+	// ignored in favour of the defaults. Strip it instead of complaining.
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 
 	// Unknown fields are deliberately ignored, so a config written by a newer
 	// version still loads in an older one.

@@ -17,6 +17,7 @@ import (
 	"streamy/internal/clipboard"
 	"streamy/internal/config"
 	"streamy/internal/hotkey"
+	"streamy/internal/pipeline"
 	"streamy/internal/tray"
 	"streamy/internal/version"
 )
@@ -55,8 +56,10 @@ type Options struct {
 	Logger     *slog.Logger
 	Config     config.Config
 	ConfigPath string
-	// Streamer is the capture pipeline. Nil means StubStreamer (phase 1).
-	Streamer Streamer
+	// Streamer is the capture pipeline. Nil means the stub, which refuses to
+	// start so the tray, the hotkey and the shutdown path can be exercised
+	// without ffmpeg.
+	Streamer pipeline.Streamer
 	// Headless runs without a tray icon, which is handy in tests and on CI.
 	Headless bool
 	// ShutdownTimeout bounds how long Stop may take. Zero means 10 seconds.
@@ -68,16 +71,16 @@ type App struct {
 	logger   *slog.Logger
 	cfg      config.Config
 	cfgPath  string
-	streamer Streamer
+	streamer pipeline.Streamer
 	hotkeys  *hotkey.Manager
 	tray     *tray.Tray
 
 	// mu guards the state below. Everything that touches them goes through a
 	// short critical section and then calls refresh() outside of it, because
 	// refresh takes the same lock in Status().
-	mu        sync.Mutex
-	state     State
-	viewerURL string
+	mu      sync.Mutex
+	state   State
+	session pipeline.Session
 
 	// copyToClipboard is a field rather than a direct call so tests can
 	// substitute it: a unit test must not overwrite the real clipboard.
@@ -101,7 +104,7 @@ func New(opts Options) (*App, error) {
 
 	streamer := opts.Streamer
 	if streamer == nil {
-		streamer = NewStubStreamer(logger)
+		streamer = pipeline.NewStub(logger)
 	}
 	timeout := opts.ShutdownTimeout
 	if timeout <= 0 {
@@ -178,7 +181,7 @@ func (a *App) onReady() error {
 			a.logger.Error("global hotkey unavailable",
 				"shortcut", a.cfg.Hotkey.Toggle, "error", err)
 			a.notify("Hotkey unavailable",
-				fmt.Sprintf("Could not use %s: %v\nStart sharing from the tray menu, or change hotkey.toggle in:\n%s",
+				fmt.Sprintf("Could not use %s: %v\nStart capturing from the tray menu, or change hotkey.toggle in:\n%s",
 					a.cfg.Hotkey.Toggle, err, a.cfgPath))
 		}
 	} else {
@@ -186,7 +189,7 @@ func (a *App) onReady() error {
 	}
 
 	a.refresh()
-	a.notify("Streamy is running", fmt.Sprintf("Press %s to start sharing.", a.cfg.Hotkey.Toggle))
+	a.notify("Streamy is running", fmt.Sprintf("Press %s to start capturing.", a.cfg.Hotkey.Toggle))
 	return nil
 }
 
@@ -211,9 +214,20 @@ func (a *App) Status() tray.Status {
 	defer a.mu.Unlock()
 	return tray.Status{
 		Sharing:   a.state == StateStreaming,
-		ViewerURL: a.viewerURL,
-		Text:      a.state.String(),
+		ViewerURL: a.session.ViewerURL,
+		Text:      a.statusTextLocked(),
+		Active:    a.session.Label,
 	}
+}
+
+// statusTextLocked returns the line shown at the top of the tray menu. It
+// prefers the pipeline's own word for what it is doing ("Recording", later
+// "Sharing") over the bare state name. The caller must hold a.mu.
+func (a *App) statusTextLocked() string {
+	if a.state == StateStreaming && a.session.Label != "" {
+		return a.session.Label
+	}
+	return a.state.String()
 }
 
 // ToggleSharing starts a stream when idle and stops it when streaming. Both the
@@ -245,43 +259,87 @@ func (a *App) startSharing() {
 	a.mu.Unlock()
 	a.refresh()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	url, err := a.streamer.Start(ctx, StartRequest{Config: a.cfg})
+	session, err := a.streamer.Start(ctx, pipeline.Request{Config: a.cfg})
 	if err != nil {
 		a.mu.Lock()
-		a.state, a.viewerURL = StateIdle, ""
+		a.state, a.session = StateIdle, pipeline.Session{}
 		a.mu.Unlock()
 		a.refresh()
 
-		if errors.Is(err, ErrNotImplemented) {
-			// Phase 1: the notification is itself the test. Seeing it pop up
-			// proves the hotkey, the app and the tray are all wired together.
-			a.logger.Info("capture pipeline not implemented yet", "phase", 2)
-			a.notify("Hotkey works", "Tray, hotkey and settings are wired up. Screen capture and WebRTC arrive in phase 2.")
+		if errors.Is(err, pipeline.ErrNotImplemented) {
+			// No pipeline is configured: the notification is itself the test.
+			// Seeing it pop up proves the hotkey, the app and the tray are all
+			// wired together.
+			a.logger.Info("no capture pipeline configured", "phase", 2)
+			a.notify("Hotkey works", "Tray, hotkey and settings are wired up, but no pipeline is configured.")
 			return
 		}
-		a.logger.Error("could not start sharing", "error", err)
-		a.notify("Could not start sharing", err.Error())
+		a.logger.Error("could not start the capture", "error", err)
+		a.notify("Could not start capturing", err.Error())
 		return
 	}
 
 	a.mu.Lock()
-	a.state, a.viewerURL = StateStreaming, url
+	a.state, a.session = StateStreaming, session
 	a.mu.Unlock()
 	a.refresh()
 
-	a.logger.Info("sharing started", "viewer", url)
+	a.logger.Info("session started",
+		"label", session.Label,
+		"description", session.Description,
+		"viewer", session.ViewerURL,
+	)
 
 	// Copying the link is a nicety: if the clipboard is locked by another
-	// process we still share, we just say so.
-	if copyErr := a.copyToClipboard(url); copyErr != nil {
-		a.logger.Warn("could not copy viewer link", "error", copyErr)
-		a.notify("Sharing started", "Viewer link:\n"+url)
-		return
+	// process we still record, we just say so.
+	var copyErr error
+	if session.ViewerURL != "" {
+		copyErr = a.copyToClipboard(session.ViewerURL)
+		if copyErr != nil {
+			a.logger.Warn("could not copy the link", "error", copyErr)
+		}
 	}
-	a.notify("Sharing started", "Viewer link copied to your clipboard:\n"+url)
+	a.announce(session, copyErr)
+}
+
+// announce reports a started session to the user.
+//
+// The wording is derived from the session rather than hard coded, because
+// "sharing" and "recording to a file" are different enough that the same
+// sentence would be wrong for one of them.
+func (a *App) announce(session pipeline.Session, copyErr error) {
+	title := sessionLabel(session, "Sharing")
+	if session.LocalRecording != "" {
+		title = "Recording started"
+	}
+
+	message := session.Description
+	switch {
+	case session.ViewerURL == "":
+		// Nothing to copy; the description already says where it is going.
+
+	case copyErr != nil:
+		message += "\n\nLink (could not copy it automatically):\n" + session.ViewerURL
+
+	case session.LocalRecording != "":
+		// The link is the recording's own path, so repeating it would be
+		// noise.
+		message += "\n\nThe link is on your clipboard."
+
+	default:
+		message += "\n\nLink copied to your clipboard:\n" + session.ViewerURL
+	}
+	a.notify(title, message)
+}
+
+func sessionLabel(session pipeline.Session, fallback string) string {
+	if session.Label == "" {
+		return fallback
+	}
+	return session.Label
 }
 
 func (a *App) stopSharing() {
@@ -298,16 +356,16 @@ func (a *App) stopSharing() {
 	defer cancel()
 
 	if err := a.streamer.Stop(ctx); err != nil {
-		a.logger.Error("problem stopping sharing", "error", err)
-		a.notify("Problem stopping sharing", err.Error())
+		a.logger.Error("problem stopping the capture", "error", err)
+		a.notify("Problem stopping", err.Error())
 	}
 
 	a.mu.Lock()
-	a.state, a.viewerURL = StateIdle, ""
+	a.state, a.session = StateIdle, pipeline.Session{}
 	a.mu.Unlock()
 	a.refresh()
 
-	a.logger.Info("sharing stopped")
+	a.logger.Info("session stopped")
 }
 
 // OpenSettings launches the settings window.
@@ -349,19 +407,19 @@ func (a *App) uiExecutable() string {
 // CopyViewerLink implements tray.Controller.
 func (a *App) CopyViewerLink() {
 	a.mu.Lock()
-	url := a.viewerURL
+	url := a.session.ViewerURL
 	a.mu.Unlock()
 
 	if url == "" {
-		a.notify("No link yet", "Start sharing first: the viewer link appears once a stream is running.")
+		a.notify("No link yet", "Start capturing first: the link appears once a session is running.")
 		return
 	}
 	if err := a.copyToClipboard(url); err != nil {
-		a.logger.Error("could not copy viewer link", "error", err)
+		a.logger.Error("could not copy the link", "error", err)
 		a.notify("Could not copy link", err.Error())
 		return
 	}
-	a.notify("Viewer link copied", url)
+	a.notify("Link copied", url)
 }
 
 // Quit implements tray.Controller and is the single "please stop" entry point.
@@ -390,7 +448,7 @@ func (a *App) shutdown(ctx context.Context) error {
 
 	a.mu.Lock()
 	wasActive := a.state == StateStreaming || a.state == StateStarting
-	a.state, a.viewerURL = StateIdle, ""
+	a.state, a.session = StateIdle, pipeline.Session{}
 	a.mu.Unlock()
 
 	if wasActive {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -33,6 +34,57 @@ func TestLoadFromWritesDefaultsWhenMissing(t *testing.T) {
 
 // A config written by an older version is missing the fields added since. They
 // must come back as their default value, not as the zero value.
+func TestLoadFromToleratesAByteOrderMark(t *testing.T) {
+	// PowerShell's Set-Content and any editor set to "UTF-8 with BOM" produce
+	// this. The settings inside are valid, and silently falling back to the
+	// defaults would look like the file was being ignored for no reason.
+	for _, tc := range []struct{ name, prefix string }{
+		{"UTF-8 BOM", "\xef\xbb\xbf"},
+		{"no BOM", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			body := `{"logLevel":"debug","encoding":{"fps":24},"capture":{"defaultTarget":"mouse"}}`
+			if err := os.WriteFile(path, []byte(tc.prefix+body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, _, err := LoadFrom(path)
+			if err != nil {
+				t.Fatalf("LoadFrom: %v", err)
+			}
+			if cfg.LogLevel != "debug" || cfg.Encoding.FPS != 24 {
+				t.Errorf("logLevel = %q, fps = %d; want \"debug\" and 24 from the file",
+					cfg.LogLevel, cfg.Encoding.FPS)
+			}
+			if cfg.Capture.DefaultTarget != TargetMouse {
+				t.Errorf("capture.defaultTarget = %q, want %q", cfg.Capture.DefaultTarget, TargetMouse)
+			}
+			// A BOM must not be mistaken for the start of the file's content,
+			// so the first key must still be parsed, not dropped.
+			if cfg.Encoding.BitrateKbps != Default().Encoding.BitrateKbps {
+				t.Errorf("encoding.bitrateKbps = %d, want the default", cfg.Encoding.BitrateKbps)
+			}
+		})
+	}
+}
+
+func TestSavedConfigHasNoByteOrderMark(t *testing.T) {
+	// The app must not write what it has just learned to tolerate: a BOM of our
+	// own would make the file unreadable to stricter tools.
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Default().SaveTo(path); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Error("the saved config starts with a UTF-8 byte order mark")
+	}
+}
+
 func TestLoadFromKeepsDefaultsForMissingFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	// Only logLevel and fps are present, and fps is intentionally non default.

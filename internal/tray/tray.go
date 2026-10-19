@@ -11,6 +11,7 @@ package tray
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"fyne.io/systray"
@@ -20,13 +21,18 @@ import (
 
 // Status is the snapshot the menu is rendered from.
 type Status struct {
-	// Sharing is true while a stream is live.
+	// Sharing is true while a session is live.
 	Sharing bool
 	// ViewerURL is the link shown to viewers, empty when nothing is running.
 	ViewerURL string
 	// Text is the free form line shown at the top of the menu and in the
 	// tooltip, e.g. "Starting…" or "Not sharing".
 	Text string
+	// Active is the pipeline's own word for a live session: "Recording" while
+	// a file is being written, "Streaming" once phase 3 sends video to
+	// viewers. The menu is built from it, so it says "Stop recording" rather
+	// than "Stop sharing" when nothing is being shared. Empty means "sharing".
+	Active string
 }
 
 // Controller is what the tray needs from the application.
@@ -153,7 +159,7 @@ func (t *Tray) onReady() {
 	// A disabled item is a tidy way to show plain text in a menu.
 	t.mStatus = systray.AddMenuItem(t.title, "")
 	t.mStatus.Disable()
-	t.mStartStop = systray.AddMenuItem("Start sharing", "Start or stop sharing")
+	t.mStartStop = systray.AddMenuItem("Start sharing", "Start or stop capturing the screen")
 	t.mSettings = systray.AddMenuItem("Open settings\u2026", "Hotkey, encoder, servers")
 	t.mCopyLink = systray.AddMenuItem("Copy viewer link", "Copy the link your viewers should open")
 	systray.AddSeparator()
@@ -211,23 +217,17 @@ func (t *Tray) Refresh() {
 	}
 
 	status := t.ctrl.Status()
+	word := actionWord(status.Active)
 
 	if status.Sharing {
 		systray.SetIcon(IconLive())
-		t.mStartStop.SetTitle("Stop sharing")
+		t.mStartStop.SetTitle("Stop " + word)
 	} else {
 		systray.SetIcon(IconIdle())
-		t.mStartStop.SetTitle("Start sharing")
+		t.mStartStop.SetTitle("Start " + word)
 	}
 
-	text := status.Text
-	if text == "" {
-		if status.Sharing {
-			text = "Sharing"
-		} else {
-			text = "Not sharing"
-		}
-	}
+	text := statusText(status, word)
 	t.mStatus.SetTitle(text)
 
 	tooltip := t.title + " \u2014 " + text
@@ -235,4 +235,31 @@ func (t *Tray) Refresh() {
 		tooltip += "\n" + status.ViewerURL
 	}
 	systray.SetTooltip(tooltip)
+}
+
+// actionWord is the verb the menu uses: the pipeline's own word for what it is
+// doing, lowercased. Phase 2 records, so the menu offers to "Start recording";
+// phase 3 streams, and the same code will say "Start streaming" without being
+// touched.
+func actionWord(active string) string {
+	if active == "" {
+		return "sharing"
+	}
+	return strings.ToLower(active)
+}
+
+// statusText is the line at the top of the menu. The controller normally
+// supplies one; this is the fallback, and it exists as a function purely so it
+// can be tested without a tray icon.
+func statusText(status Status, word string) string {
+	if status.Text != "" {
+		return status.Text
+	}
+	if status.Sharing {
+		if status.Active != "" {
+			return status.Active
+		}
+		return "Sharing"
+	}
+	return "Not " + word
 }
