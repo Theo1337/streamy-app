@@ -1,0 +1,9 @@
+# Keep line endings normalised in the repository regardless of the OS that
+# clones it, so `gofmt -l` stays quiet and diffs stay clean.
+* text=auto eol=lf
+
+# Binaries git should never try to convert.
+*.ico binary
+*.png binary
+*.exe binary
+*.syso binary

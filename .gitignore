@@ -1,0 +1,25 @@
+# Build output
+/dist/
+*.exe
+streamy
+streamy-ui
+
+# Go tooling
+*.test
+*.out
+coverage.html
+
+# Wails frontend (phase 6)
+ui/frontend/node_modules/
+ui/frontend/dist/
+ui/build/bin/
+
+# Logs and local state
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
