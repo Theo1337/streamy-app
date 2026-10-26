@@ -1,33 +1,32 @@
-# ui/ (phase 6)
+# ui/
 
-The on-demand settings and picker window: a Wails application (Go backend plus a
-webview) with a Svelte frontend.
+The on-demand settings and picker window: a separate Wails process with a Svelte
+frontend. The tray does not import Wails or load WebView2 while idle. A random,
+per-launch token protects the local HTTP IPC server, which binds only to
+`127.0.0.1`.
 
-It is a **separate process** that the tray launches when you open settings, and it
-exits when you close it. That keeps the always-on tray process free of any UI
-framework, which is a hard requirement: it must idle at a few megabytes of RAM.
-
-## Planned contents
+## Contents
 
 | Path | Purpose |
 | --- | --- |
-| `main.go` | Wails entry point: window setup, bindings |
-| `app.go` | The bridge: reads and writes the config, hands capture targets to the tray |
-| `frontend/` | Svelte app: the screen/window picker with live thumbnails, and the settings form |
-| `frontend/src/lib/ipc.js` | The client side of the tray ↔ UI channel (named pipe or localhost WebSocket) |
-| `wails.json` | Wails project configuration |
+| `main.go` | Wails entry point and embedded frontend |
+| `app.go` | Wails methods that call authenticated tray IPC endpoints |
+| `frontend/` | Svelte settings form, target list and refreshed live previews |
+| `../internal/app/ipc.go` | Loopback IPC endpoints, config persistence and target selection |
 
-## Planned build
+The picker previews monitors and visible windows, then starts a share on the
+selected target. Settings include first-run setup, Discord identity, startup,
+hotkeys, capture behavior, resolution, fps,
+bitrate, encoder, STUN/TURN, signaling endpoints and viewer count.
+
+## Build
 
 ```powershell
-cd ui
-wails build          # produces streamy-ui.exe next to the tray's streamy.exe
+cd screenshare-app
+.\build.ps1
 ```
 
-`internal/app/app.go` already looks for `streamy-ui.exe` beside the tray binary
-and launches it when available, falling back to a notification that explains the
-window is not built yet. So the wiring is in place; only the UI process itself is
-missing.
-
-Nothing is implemented yet. This placeholder exists so the folder layout matches
-the project plan from the start.
+The build script compiles the Svelte frontend, embeds its assets, and builds
+Wails with the required `production,desktop` Go build tags. Keep `streamy.exe`
+and `streamy-ui.exe` together in `out\bin`. Windows 10/11 needs the Microsoft
+Edge WebView2 Runtime, which is not bundled.

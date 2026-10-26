@@ -95,6 +95,20 @@ func (r Rect) CoveredBy(other Rect, tolerance int) bool {
 		other.Y+other.Height >= r.Y+r.Height-tolerance
 }
 
+// Intersect returns the part of r that is inside other, or an empty rectangle
+// when they do not overlap. A window routinely sticks out past its monitor, and
+// the part that is off screen cannot be captured.
+func (r Rect) Intersect(other Rect) Rect {
+	x := max(r.X, other.X)
+	y := max(r.Y, other.Y)
+	right := min(r.X+r.Width, other.X+other.Width)
+	bottom := min(r.Y+r.Height, other.Y+other.Height)
+	if right <= x || bottom <= y {
+		return Rect{}
+	}
+	return Rect{X: x, Y: y, Width: right - x, Height: bottom - y}
+}
+
 // FullscreenTolerance is how many pixels a window may be smaller than its
 // monitor and still count as fullscreen.
 //
@@ -181,9 +195,9 @@ type Target struct {
 // A window is named by its class and its owning process, never by its title. A
 // title is whatever the user happens to have open at that moment — a message, a
 // half-written document, a page — and this string is written to the log, put in
-// a notification and pasted into bug reports. Titles are used to *find* a window
-// (gdigrab's `title=`, and the CLI's -window) and for nothing else. `-titles`
-// is the single switch that lets one appear in output.
+// a notification and pasted into bug reports. Titles are used to *find* a
+// window (the CLI's -window and the picker) and for nothing else. `-titles` is
+// the single switch that lets one appear in output.
 func (t Target) Describe() string {
 	if t.Kind == KindWindow {
 		return fmt.Sprintf("window class %q pid %d (%s)", t.Window.Class, t.Window.PID, t.Window.Rect)
@@ -324,6 +338,42 @@ func windowTarget(w Window, d Desktop, cfg config.Config, reason string) Target 
 		t.Monitor = d.Monitors[idx]
 	}
 	return t
+}
+
+// WithDesktop fills in the monitor a window target sits on, when it is not set
+// already.
+//
+// Capture reads the composited desktop, so a window is recorded as the
+// rectangle it occupies. Knowing which monitor that rectangle belongs to lets
+// ffmpeg duplicate that monitor and crop the window out of it, which is much
+// cheaper than a GDI copy. Targets created by the CLI or the picker do not
+// always carry a monitor, so this is applied before capture starts.
+func (t Target) WithDesktop(d Desktop) Target {
+	if t.Kind != KindWindow || !t.Monitor.Bounds.Empty() {
+		return t
+	}
+	if idx := d.monitorContaining(t.Window.Rect); idx >= 0 {
+		t.Monitor = d.Monitors[idx]
+	}
+	return t
+}
+
+// windowRegion is the visible part of a window's rectangle, in desktop
+// coordinates.
+//
+// Capture reads the composited desktop, so a window is grabbed as the rectangle
+// it occupies rather than through its own drawing surface. Clipping to the
+// monitor keeps the rectangle inside the duplicated (or GDI) surface, and it
+// also means a window dragged halfway off screen still captures what is left.
+func (t Target) windowRegion() (Rect, bool) {
+	if t.Kind != KindWindow {
+		return Rect{}, false
+	}
+	region := t.Window.Rect.Intersect(t.Monitor.Bounds)
+	if region.Empty() {
+		return Rect{}, false
+	}
+	return region, true
 }
 
 // monitorContaining returns the index of the monitor with the largest overlap

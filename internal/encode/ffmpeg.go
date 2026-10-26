@@ -16,6 +16,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"streamy/internal/executil"
 )
 
 // Logger is the part of log/slog this package uses. Depending on the interface
@@ -65,15 +67,27 @@ func resolvePath(configured string) (string, error) {
 	configured = strings.TrimSpace(configured)
 
 	if configured == "" {
+		// An installed Streamy bundles ffmpeg beside the executable; look
+		// there before falling back to PATH so a machine without a system-wide
+		// ffmpeg still works.
+		if bundled, ok := bundledFFmpeg(); ok {
+			return bundled, nil
+		}
 		found, err := exec.LookPath("ffmpeg")
 		if err != nil {
-			return "", errors.New("ffmpeg was not found on PATH; install it (on Windows: winget install Gyan.FFmpeg) or point encoding.ffmpegPath at it in the config")
+			return "", errors.New("ffmpeg was not found on PATH or beside Streamy; install it (on Windows: winget install Gyan.FFmpeg) or point encoding.ffmpegPath at it in the config")
 		}
 		return found, nil
 	}
 
 	info, err := os.Stat(configured)
 	if err != nil {
+		// A config copied from a development machine can point at a WinGet
+		// package that is no longer there. Prefer the copy the installer
+		// bundled instead of failing every stream with a stale absolute path.
+		if bundled, ok := bundledFFmpeg(); ok {
+			return bundled, nil
+		}
 		return "", fmt.Errorf("encoding.ffmpegPath %q: %w", configured, err)
 	}
 	if info.IsDir() {
@@ -89,6 +103,26 @@ func resolvePath(configured string) (string, error) {
 	return configured, nil
 }
 
+// bundledFFmpeg returns the ffmpeg shipped beside the installed executable, if
+// there is one. The app never downloads it; it is part of the installer.
+func bundledFFmpeg() (string, bool) {
+	self, err := os.Executable()
+	if err != nil {
+		return "", false
+	}
+	dir := filepath.Dir(self)
+	for _, candidate := range []string{
+		filepath.Join(dir, "tools", "ffmpeg", "bin", "ffmpeg"),
+		filepath.Join(dir, "ffmpeg", "bin", "ffmpeg"),
+		filepath.Join(dir, "ffmpeg"),
+	} {
+		if found, err := exec.LookPath(candidate); err == nil {
+			return found, true
+		}
+	}
+	return "", false
+}
+
 // output runs ffmpeg to completion and returns everything it wrote.
 //
 // It is only for short, non-interactive calls such as -version and the encoder
@@ -96,6 +130,7 @@ func resolvePath(configured string) (string, error) {
 // stopped gracefully.
 func (f FFmpeg) output(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, f.Path, args...)
+	executil.HideConsoleWindow(cmd)
 	// ffmpeg writes all of its diagnostics to stderr, including the version
 	// banner, so both streams are wanted.
 	out, err := cmd.CombinedOutput()

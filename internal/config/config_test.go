@@ -12,6 +12,15 @@ func TestDefaultIsValid(t *testing.T) {
 	if err := Default().Validate(); err != nil {
 		t.Fatalf("Default().Validate() = %v, want nil", err)
 	}
+	if Default().Signaling.URL != DefaultSignalingURL || Default().Signaling.ViewerURL != DefaultViewerURL {
+		t.Fatalf("default endpoints = %+v, want bundled deployment endpoints", Default().Signaling)
+	}
+	if !Default().Capture.DesktopAudio {
+		t.Fatal("desktop audio should be enabled by default")
+	}
+	if !Default().Capture.ExcludeDiscordAudio {
+		t.Fatal("Discord audio should be excluded by default")
+	}
 }
 
 func TestLoadFromWritesDefaultsWhenMissing(t *testing.T) {
@@ -60,12 +69,53 @@ func TestLoadFromToleratesAByteOrderMark(t *testing.T) {
 			if cfg.Capture.DefaultTarget != TargetMouse {
 				t.Errorf("capture.defaultTarget = %q, want %q", cfg.Capture.DefaultTarget, TargetMouse)
 			}
+			if !cfg.Capture.DesktopAudio {
+				t.Error("missing capture.desktopAudio should use the enabled default")
+			}
+			if !cfg.Capture.ExcludeDiscordAudio {
+				t.Error("missing capture.excludeDiscordAudio should use the enabled default")
+			}
+			if cfg.SetupComplete || cfg.RunAtStartup {
+				t.Errorf("missing setup/startup settings = %t/%t, want false/false", cfg.SetupComplete, cfg.RunAtStartup)
+			}
+			if cfg.Signaling.URL != DefaultSignalingURL || cfg.Signaling.ViewerURL != DefaultViewerURL {
+				t.Errorf("missing service endpoints = %+v, want bundled defaults", cfg.Signaling)
+			}
 			// A BOM must not be mistaken for the start of the file's content,
 			// so the first key must still be parsed, not dropped.
 			if cfg.Encoding.BitrateKbps != Default().Encoding.BitrateKbps {
 				t.Errorf("encoding.bitrateKbps = %d, want the default", cfg.Encoding.BitrateKbps)
 			}
 		})
+	}
+}
+
+func TestLoadFromFillsEmptyBundledServiceEndpoints(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"signaling":{"url":"","viewerURL":""}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if cfg.Signaling.URL != DefaultSignalingURL || cfg.Signaling.ViewerURL != DefaultViewerURL {
+		t.Fatalf("signaling = %+v, want bundled defaults", cfg.Signaling)
+	}
+}
+
+func TestLoadFromMovesLegacyViewerAliasToProduction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	legacy := `{"signaling":{"viewerURL":"https://master.streamy-viewer.pages.dev/"}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if cfg.Signaling.ViewerURL != DefaultViewerURL {
+		t.Fatalf("viewerURL = %q, want %q", cfg.Signaling.ViewerURL, DefaultViewerURL)
 	}
 }
 
@@ -117,10 +167,49 @@ func TestLoadFromKeepsDefaultsForMissingFields(t *testing.T) {
 	}
 }
 
+func TestLoadFromMigratesLegacyRelayNotification(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	legacy := `{
+		"schema": 2,
+		"stream": {
+			"relay": {
+				"enabled": true,
+				"url": "wss://relay.example.com",
+				"token": "publisher-secret",
+				"channelID": "123456789012345678",
+				"only": true,
+				"notifyURL": "http://127.0.0.1:8791/api/notify",
+				"notifyKey": "notify-secret"
+			}
+		}
+	}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, created, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if created {
+		t.Fatal("LoadFrom reported a created file for an existing config")
+	}
+	want := DiscordBot{
+		ChannelID: "123456789012345678",
+		NotifyURL: "http://127.0.0.1:8791/api/notify",
+		NotifyKey: "notify-secret",
+	}
+	if cfg.Stream.Discord != want {
+		t.Fatalf("stream.discord = %+v, want %+v", cfg.Stream.Discord, want)
+	}
+}
+
 func TestSaveToRoundTrips(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 
 	want := Default()
+	want.SetupComplete = true
+	want.RunAtStartup = true
 	want.Hotkey.Toggle = "Alt+Win+P"
 	want.Stream.MaxViewers = 3
 	if err := want.SaveTo(path); err != nil {
@@ -136,6 +225,9 @@ func TestSaveToRoundTrips(t *testing.T) {
 	}
 	if got.Stream.MaxViewers != want.Stream.MaxViewers {
 		t.Errorf("stream.maxViewers = %d, want %d", got.Stream.MaxViewers, want.Stream.MaxViewers)
+	}
+	if got.SetupComplete != want.SetupComplete || got.RunAtStartup != want.RunAtStartup {
+		t.Errorf("setup/startup = %t/%t, want %t/%t", got.SetupComplete, got.RunAtStartup, want.SetupComplete, want.RunAtStartup)
 	}
 }
 
@@ -172,10 +264,22 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"silly fps", func(c *Config) { c.Encoding.FPS = 1000 }},
 		{"bitrate too low", func(c *Config) { c.Encoding.BitrateKbps = 5 }},
 		{"negative viewers", func(c *Config) { c.Stream.MaxViewers = -1 }},
+		{"viewers above Worker limit", func(c *Config) { c.Stream.MaxViewers = 21 }},
+		{"invalid STUN URL", func(c *Config) { c.Stream.STUNServers = []string{"turn:relay.example"} }},
+		{"invalid TURN URL", func(c *Config) { c.Stream.TURNServers = []TURNServer{{URLs: []string{"stun:stun.example"}}} }},
 		{"bad default target", func(c *Config) { c.Capture.DefaultTarget = "everything" }},
 		{"bad log level", func(c *Config) { c.LogLevel = "verbose" }},
 		{"signaling without scheme", func(c *Config) { c.Signaling.URL = "example.com" }},
 		{"signaling with http", func(c *Config) { c.Signaling.URL = "https://example.com" }},
+		{"signaling without host", func(c *Config) { c.Signaling.URL = "wss:" }},
+		{"viewer signaling with ws", func(c *Config) { c.Signaling.ViewerURL = "wss://example.com" }},
+		{"notify without key", func(c *Config) {
+			c.Stream.Discord = DiscordBot{NotifyURL: "https://bot.example.com/api/notify"}
+		}},
+		{"notify with invalid URL", func(c *Config) {
+			c.Stream.Discord = DiscordBot{NotifyURL: "not-a-url", NotifyKey: "k"}
+		}},
+		{"invalid channel ID", func(c *Config) { c.Stream.Discord.ChannelID = "general" }},
 		{"future schema", func(c *Config) { c.Schema = CurrentSchema + 1 }},
 	}
 
@@ -196,7 +300,13 @@ func TestValidateAcceptsGoodValues(t *testing.T) {
 	cfg.Encoding.Resolution = "1920x1080"
 	cfg.Encoding.Encoder = EncoderNVENC
 	cfg.Signaling.URL = "wss://streamy-signal.example.workers.dev"
+	cfg.Signaling.ViewerURL = "https://streamy-viewer.pages.dev/"
 	cfg.Stream.MaxViewers = 0 // unlimited
+	cfg.Stream.Discord = DiscordBot{
+		ChannelID: "123456789012345678",
+		NotifyURL: "https://bot.example.com/api/notify",
+		NotifyKey: "notify-secret",
+	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil", err)
 	}

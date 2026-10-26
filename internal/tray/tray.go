@@ -22,17 +22,27 @@ import (
 // Status is the snapshot the menu is rendered from.
 type Status struct {
 	// Sharing is true while a session is live.
-	Sharing bool
+	Sharing bool `json:"sharing"`
 	// ViewerURL is the link shown to viewers, empty when nothing is running.
-	ViewerURL string
+	ViewerURL string `json:"viewerURL"`
 	// Text is the free form line shown at the top of the menu and in the
 	// tooltip, e.g. "Starting…" or "Not sharing".
-	Text string
+	Text string `json:"text"`
 	// Active is the pipeline's own word for a live session: "Recording" while
 	// a file is being written, "Streaming" once phase 3 sends video to
 	// viewers. The menu is built from it, so it says "Stop recording" rather
 	// than "Stop sharing" when nothing is being shared. Empty means "sharing".
-	Active string
+	Active string `json:"active"`
+	// Target identifies what is being captured right now, so the picker can
+	// show a Live badge on the correct card.
+	Target *Target `json:"target,omitempty"`
+}
+
+// Target is the capture target the picker should mark as live.
+type Target struct {
+	Kind   string `json:"kind"`
+	Index  int    `json:"index"`
+	Handle string `json:"handle,omitempty"`
 }
 
 // Controller is what the tray needs from the application.

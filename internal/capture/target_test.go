@@ -341,7 +341,16 @@ func TestMonitorAtPoint(t *testing.T) {
 
 func TestChooseGrabber(t *testing.T) {
 	mon := Target{Kind: KindMonitor}
-	win := Target{Kind: KindWindow, Window: Window{Title: "x"}}
+	monWithoutOutput := Target{
+		Kind:    KindMonitor,
+		Monitor: Monitor{Index: 1, DXGIIndex: -1, Bounds: Rect{X: -1920, Width: 1920, Height: 1080}},
+	}
+	onScreen := Target{
+		Kind:    KindWindow,
+		Window:  Window{Rect: Rect{X: 100, Y: 100, Width: 800, Height: 600}},
+		Monitor: Monitor{DXGIIndex: 0, Bounds: Rect{Width: 1920, Height: 1080}},
+	}
+	offScreen := Target{Kind: KindWindow, Window: Window{Rect: Rect{X: 100, Y: 100, Width: 800, Height: 600}}}
 
 	withDDA := Capabilities{DDAGrab: true}
 	withoutDDA := Capabilities{DDAGrab: false}
@@ -352,9 +361,45 @@ func TestChooseGrabber(t *testing.T) {
 	if got := mon.ChooseGrabber(withoutDDA); got != GrabberGDigrab {
 		t.Errorf("monitor without ddagrab: %q, want %q", got, GrabberGDigrab)
 	}
-	// ddagrab cannot target a single window, whatever the capabilities say.
-	if got := win.ChooseGrabber(withDDA); got != GrabberGDigrab {
-		t.Errorf("window: %q, want %q", got, GrabberGDigrab)
+	// joinMonitors leaves DXGIIndex at -1 when a monitor cannot be reached by
+	// ffmpeg's D3D11 adapter. ddagrab cannot address it, so it has to use GDI
+	// instead of failing to build the input.
+	if got := monWithoutOutput.ChooseGrabber(withDDA); got != GrabberGDigrab {
+		t.Errorf("monitor with no DXGI output: %q, want %q", got, GrabberGDigrab)
+	}
+	// A window is cropped out of a duplicated output, which is both cheaper
+	// and the only way to see a GPU-composited window.
+	if got := onScreen.ChooseGrabber(withDDA); got != GrabberDDAGrab {
+		t.Errorf("window on a known monitor with ddagrab: %q, want %q", got, GrabberDDAGrab)
+	}
+	if got := onScreen.ChooseGrabber(withoutDDA); got != GrabberGDigrab {
+		t.Errorf("window without ddagrab: %q, want %q", got, GrabberGDigrab)
+	}
+	if got := offScreen.ChooseGrabber(withDDA); got != GrabberGDigrab {
+		t.Errorf("window with no known monitor: %q, want %q", got, GrabberGDigrab)
+	}
+}
+
+func TestInputSpecDDAGrabWindowCrops(t *testing.T) {
+	target := Target{
+		Kind:    KindWindow,
+		Window:  Window{Rect: Rect{X: 2020, Y: 40, Width: 1200, Height: 900}},
+		Monitor: Monitor{DXGIIndex: 1, Bounds: Rect{X: 1920, Width: 2560, Height: 1440}},
+	}
+
+	spec, err := target.InputSpec(InputOptions{Grabber: GrabberDDAGrab, FPS: 60})
+	if err != nil {
+		t.Fatalf("InputSpec: %v", err)
+	}
+	if !contains(join(spec.Args), "ddagrab=output_idx=1:framerate=60") {
+		t.Errorf("args %v do not duplicate the window's monitor", spec.Args)
+	}
+	// The window starts 100 pixels into the monitor, and H.264 needs an even
+	// frame size.
+	for _, want := range []string{"hwdownload", "crop=1200:900:100:40", "scale=trunc(iw/2)*2"} {
+		if !contains(spec.Filters, want) {
+			t.Errorf("filters %q do not contain %q", spec.Filters, want)
+		}
 	}
 }
 
@@ -413,8 +458,9 @@ func TestInputSpecGDigrabMonitor(t *testing.T) {
 
 func TestInputSpecGDigrabWindow(t *testing.T) {
 	target := Target{
-		Kind:   KindWindow,
-		Window: Window{Title: `Notes: C:\tmp`, Class: "Notepad"},
+		Kind:    KindWindow,
+		Window:  Window{Title: `Notes: C:\tmp`, Class: "Notepad", Rect: Rect{X: -500, Y: 100, Width: 1000, Height: 700}},
+		Monitor: Monitor{Bounds: Rect{X: -1920, Width: 2560, Height: 1080}},
 	}
 
 	spec, err := target.InputSpec(InputOptions{Grabber: GrabberGDigrab, FPS: 30, DrawMouse: true})
@@ -422,24 +468,56 @@ func TestInputSpecGDigrabWindow(t *testing.T) {
 		t.Fatalf("InputSpec: %v", err)
 	}
 
-	if len(spec.Args) == 0 || spec.Args[len(spec.Args)-1] != `title=Notes\: C\:\\tmp` {
-		t.Errorf("last arg = %q, want the window title with the syntax characters escaped", spec.Args[len(spec.Args)-1])
+	// The window is clipped to its monitor so the offsets stay inside the
+	// desktop, which is what keeps GDI from returning black.
+	args := join(spec.Args)
+	for _, want := range []string{"-offset_x -500", "-offset_y 100", "-video_size 1000x700", "-i desktop", "-draw_mouse 1"} {
+		if !contains(args, want) {
+			t.Errorf("args %q do not contain %q", args, want)
+		}
+	}
+	if contains(args, "title=") {
+		t.Errorf("args %q still select the window by title, which is black for GPU-composited windows", args)
+	}
+	if !contains(spec.Filters, "scale=trunc(iw/2)*2") {
+		t.Errorf("filters %q do not round the window size to even dimensions", spec.Filters)
 	}
 }
 
-func TestInputSpecDDAGrabRejectsWindow(t *testing.T) {
-	// Asking for a window with ddagrab is a programming error, not a user
-	// error, so it must be caught rather than quietly capturing the monitor.
-	target := Target{Kind: KindWindow, Window: Window{Title: "x"}}
+func TestInputSpecDDAGrabClipsWindowToMonitor(t *testing.T) {
+	target := Target{
+		Kind:    KindWindow,
+		Window:  Window{Rect: Rect{X: 1600, Y: 0, Width: 800, Height: 600}},
+		Monitor: Monitor{DXGIIndex: 0, Bounds: Rect{Width: 1920, Height: 1080}},
+	}
+	spec, err := target.InputSpec(InputOptions{Grabber: GrabberDDAGrab})
+	if err != nil {
+		t.Fatalf("InputSpec: %v", err)
+	}
+	// Only the 320 pixels that are still on screen can be captured.
+	if !contains(spec.Filters, "crop=320:600:1600:0") {
+		t.Errorf("filters %q do not clip the window to its monitor", spec.Filters)
+	}
+}
+
+func TestInputSpecWindowWithoutMonitor(t *testing.T) {
+	// ddagrab needs to know which monitor to duplicate, so a window whose
+	// monitor is unknown is rejected there...
+	target := Target{
+		Kind:   KindWindow,
+		Window: Window{Rect: Rect{X: 100, Y: 50, Width: 800, Height: 600}},
+	}
 	if _, err := target.InputSpec(InputOptions{Grabber: GrabberDDAGrab}); err == nil {
-		t.Fatal("ddagrab accepted a window target")
+		t.Fatal("ddagrab accepted a window with no monitor")
 	}
-}
-
-func TestInputSpecWindowWithoutTitle(t *testing.T) {
-	target := Target{Kind: KindWindow, Window: Window{}}
-	if _, err := target.InputSpec(InputOptions{Grabber: GrabberGDigrab}); err == nil {
-		t.Fatal("a window with no title was accepted; gdigrab would match the wrong window")
+	// ...but GDI addresses the virtual desktop by rectangle, so it can still
+	// capture it without one.
+	spec, err := target.InputSpec(InputOptions{Grabber: GrabberGDigrab})
+	if err != nil {
+		t.Fatalf("gdigrab rejected a window with no monitor: %v", err)
+	}
+	if !contains(join(spec.Args), "-video_size 800x600") {
+		t.Errorf("args %v do not use the window rectangle", spec.Args)
 	}
 }
 

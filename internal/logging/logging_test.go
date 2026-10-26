@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -59,6 +60,33 @@ func TestSetupWithoutFileOnlyUsesStderr(t *testing.T) {
 	}
 	if err := closeLog(); err != nil {
 		t.Fatalf("close: %v", err)
+	}
+}
+
+// failingWriter stands in for the invalid stderr handle of a GUI build.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("no console") }
+
+func TestTeeWriterWritesFileWhenConsoleFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "streamy.log")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := teeWriter{console: failingWriter{}, file: file}
+	if n, err := w.Write([]byte("line from a GUI build\n")); err != nil || n == 0 {
+		t.Fatalf("Write = %d, %v, want the line written", n, err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "line from a GUI build"; !contains(string(data), want) {
+		t.Errorf("log file does not contain %q: %q", want, data)
 	}
 }
 

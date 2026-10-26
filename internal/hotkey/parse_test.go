@@ -26,6 +26,14 @@ func TestParse(t *testing.T) {
 		{in: "Win+Alt+S", want: "Alt+Win+S", wantKey: hotkey.KeyS, wantMods: []hotkey.Modifier{hotkey.ModAlt, hotkey.ModWin}},
 		{in: "Ctrl+5", want: "Ctrl+5", wantKey: hotkey.Key5, wantMods: []hotkey.Modifier{hotkey.ModCtrl}},
 		{in: "Ctrl+F20", want: "Ctrl+F20", wantKey: hotkey.KeyF20, wantMods: []hotkey.Modifier{hotkey.ModCtrl}},
+		// Punctuation and numpad keys: non-letter shortcuts are useful for
+		// keys that the streamer's applications do not already use.
+		{in: "Ctrl+\\", want: "Ctrl+\\", wantKey: hotkey.Key(0xDC), wantMods: []hotkey.Modifier{hotkey.ModCtrl}},
+		{in: "ctrl + shift + .", want: "Ctrl+Shift+.", wantKey: hotkey.Key(0xBE), wantMods: []hotkey.Modifier{hotkey.ModCtrl, hotkey.ModShift}},
+		{in: "Ctrl+Equal", want: "Ctrl+Equal", wantKey: hotkey.Key(0xBB), wantMods: []hotkey.Modifier{hotkey.ModCtrl}},
+		{in: "Ctrl+=", want: "Ctrl+Equal", wantKey: hotkey.Key(0xBB), wantMods: []hotkey.Modifier{hotkey.ModCtrl}},
+		{in: "Alt+NumpadAdd", want: "Alt+NumpadAdd", wantKey: hotkey.Key(0x6B), wantMods: []hotkey.Modifier{hotkey.ModAlt}},
+		{in: "Ctrl+PageUp", want: "Ctrl+PageUp", wantKey: hotkey.Key(0x21), wantMods: []hotkey.Modifier{hotkey.ModCtrl}},
 		// Duplicated modifiers collapse.
 		{in: "Ctrl+Control+X", want: "Ctrl+X", wantKey: hotkey.KeyX, wantMods: []hotkey.Modifier{hotkey.ModCtrl}},
 

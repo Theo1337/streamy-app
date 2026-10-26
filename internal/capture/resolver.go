@@ -23,6 +23,9 @@ type TargetResolver interface {
 	// draw its list, and the auto switch uses it to notice that the fullscreen
 	// app has moved to another monitor.
 	Snapshot(ctx context.Context) (Desktop, error)
+
+	// Windows lists the capturable top-level windows for the on-demand picker.
+	Windows(ctx context.Context) ([]Window, error)
 }
 
 // NewResolver returns the TargetResolver for the platform this binary was built

@@ -350,8 +350,17 @@ func recordViaRecorder(ctx context.Context, cfg config.Config, logger *slog.Logg
 
 	recorder := pipeline.NewRecorder(recorderOpts)
 
+	req := pipeline.Request{Config: cfg}
+	if opts.window != "" || opts.monitor >= 0 {
+		target, err := chooseTarget(ctx, capture.NewResolver(logger), cfg, opts)
+		if err != nil {
+			return err
+		}
+		req.Target = &target
+	}
+
 	start := time.Now()
-	session, err := recorder.Start(ctx, pipeline.Request{Config: cfg})
+	session, err := recorder.Start(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -582,12 +591,19 @@ func windowTarget(ctx context.Context, resolver capture.TargetResolver, title st
 		return capture.Target{}, fmt.Errorf("no window title contains %q; run -list-windows to see what is open", title)
 	case 1:
 		w := matches[0]
-		return capture.Target{
+		target := capture.Target{
 			Kind:   capture.KindWindow,
 			Window: w,
 			Cursor: true,
 			Reason: fmt.Sprintf("-window %q matched %q", title, w.Title),
-		}, nil
+		}
+		// Attaching the window's monitor lets ffmpeg duplicate that monitor and
+		// crop the window out, which is both cheaper than GDI and immune to the
+		// black picture GDI returns for GPU-composited windows.
+		if desktop, err := resolver.Snapshot(ctx); err == nil {
+			target = target.WithDesktop(desktop)
+		}
+		return target, nil
 	default:
 		var b strings.Builder
 		fmt.Fprintf(&b, "%q matches %d windows, so it is ambiguous:\n", title, len(matches))
@@ -600,13 +616,11 @@ func windowTarget(ctx context.Context, resolver capture.TargetResolver, title st
 
 // formatCommand renders an argument list the way it could be pasted into a
 // shell, quoting anything with a space in it.
-// formatCommand renders the ffmpeg command line for -print-command.
 //
-// A windowed capture has to pass the window's title to gdigrab, because that is
-// the only way gdigrab can select a window. That title is whatever the user has
-// open, so unless -titles was given it is replaced here rather than printed into
-// a terminal that is about to be pasted into a bug report. The command with the
-// title in it is still run; only the display of it is redacted.
+// A windowed capture used to pass the window's title to gdigrab, because that
+// was the only way gdigrab could select a window. It is captured as a desktop
+// rectangle now, but the redaction stays: a title is whatever the user has open,
+// and no future argument should be assumed to be safe to print.
 func formatCommand(exe string, args []string, showTitles bool) string {
 	parts := make([]string, 0, len(args)+1)
 	parts = append(parts, quoteArg(exe))

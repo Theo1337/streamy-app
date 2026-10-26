@@ -23,8 +23,9 @@ import (
 // ffmpeg reports an unusable encoder, a missing capture device or a bad option
 // by exiting within a few hundred milliseconds. Waiting before declaring
 // success is the difference between "recording started" being true and being
-// merely optimistic.
-const startupGrace = 900 * time.Millisecond
+// merely optimistic. Half a second covers those failures without making the
+// hotkey feel slow; a process that is still alive after that is capturing.
+const startupGrace = 500 * time.Millisecond
 
 // switchPollInterval is how often the auto switch looks for a changed target.
 const switchPollInterval = 2 * time.Second
@@ -55,14 +56,17 @@ type Recorder struct {
 	resolver     capture.TargetResolver
 
 	// mu guards everything below.
-	mu        sync.Mutex
-	runner    *encode.Runner
-	session   Session
-	target    capture.Target
-	encoder   encode.Encoder
-	cancelRun context.CancelFunc
-	watcher   chan struct{}
-	pumpDone  chan struct{}
+	mu          sync.Mutex
+	runner      *encode.Runner
+	session     Session
+	target      capture.Target
+	encoder     encode.Encoder
+	cfg         config.Config
+	cancelRun   context.CancelFunc
+	watcher     chan struct{}
+	watchCancel context.CancelFunc
+	pumpDone    chan struct{}
+	frameSource io.Closer
 }
 
 // Options configures a Recorder.
@@ -81,6 +85,9 @@ type Options struct {
 	// Stdout, when set, receives the encoded stream instead of a file, and the
 	// recorder writes nothing to disk.
 	Stdout io.Writer
+	// CloseStdout closes Stdout after ffmpeg's output is drained. This is useful
+	// for an io.PipeWriter, where close signals EOF to the reader.
+	CloseStdout bool
 }
 
 // NewRecorder returns a Recorder.
@@ -90,6 +97,18 @@ func NewRecorder(opts Options) *Recorder {
 		logger = slog.Default()
 	}
 	return &Recorder{opts: opts, logger: logger}
+}
+
+// SetStdout makes the next Start write the encoded stream to w instead of a
+// file, and close w afterwards when closeAfter is set.
+//
+// A Recorder is reused across sessions so its one-time probes are paid once,
+// but the pipe that carries one stream is worthless to the next one, so the
+// writer has to be replaced before each Start. It is not safe to call while a
+// stream is running.
+func (r *Recorder) SetStdout(w io.Writer, closeAfter bool) {
+	r.opts.Stdout = w
+	r.opts.CloseStdout = closeAfter
 }
 
 // Start resolves the target, starts ffmpeg and returns the session.
@@ -120,7 +139,7 @@ func (r *Recorder) Start(ctx context.Context, req Request) (Session, error) {
 	// from its cancellation, and Stop cancels that.
 	runCtx, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
 
-	session, err := r.startCapture(runCtx, req.Config, ffmpeg, encoder, true)
+	session, err := r.startCapture(runCtx, req.Config, ffmpeg, encoder, req.Target, true)
 	if err != nil {
 		cancelRun()
 		return Session{}, err
@@ -130,7 +149,7 @@ func (r *Recorder) Start(ctx context.Context, req Request) (Session, error) {
 	r.cancelRun = cancelRun
 	r.mu.Unlock()
 
-	if req.Config.Capture.AutoSwitchTarget {
+	if req.Config.Capture.AutoSwitchTarget && req.Target == nil {
 		// Off by default, because switching targets restarts the encoder and
 		// therefore starts a new file.
 		r.startWatcher(runCtx, req.Config, ffmpeg, encoder)
@@ -139,18 +158,109 @@ func (r *Recorder) Start(ctx context.Context, req Request) (Session, error) {
 	return session, nil
 }
 
+// preparedCapture is a resolved target whose ffmpeg input has already been
+// built and validated. Preparing before starting is what lets a switch reject
+// an uncapturable target without stopping the healthy capture it replaces.
+type preparedCapture struct {
+	target       capture.Target
+	grabber      capture.Grabber
+	capabilities capture.Capabilities
+	input        *encode.InputOverride
+	frameSource  io.Closer
+}
+
+// prepareCapture resolves the target and builds its ffmpeg input without
+// starting ffmpeg.
+//
+// Start and the switch both go through it. The only side effect is a window
+// frame source, which the caller owns and must close if the capture is not
+// started; everything else is pure argument building.
+func (r *Recorder) prepareCapture(ctx context.Context, cfg config.Config, ffmpeg encode.FFmpeg, encoder encode.Encoder, requested *capture.Target) (preparedCapture, error) {
+	capabilities := r.capabilities(ctx, ffmpeg, cfg)
+
+	var target capture.Target
+	if requested != nil {
+		target = *requested
+		target.Cursor = cfg.Capture.CaptureCursor
+		if target.Kind == capture.KindWindow && target.Monitor.Bounds.Empty() {
+			// A window is recorded as the rectangle it occupies on the
+			// composited desktop; knowing its monitor allows the cheaper
+			// duplicate-and-crop path.
+			if desktop, err := r.targetResolver().Snapshot(ctx); err == nil {
+				target = target.WithDesktop(desktop)
+			}
+		}
+	} else {
+		var err error
+		target, err = r.targetResolver().Resolve(ctx, cfg)
+		if err != nil {
+			return preparedCapture{}, err
+		}
+	}
+	grabber := target.ChooseGrabber(capabilities)
+	var inputOverride *encode.InputOverride
+	var frameSource io.Closer
+	if target.Kind == capture.KindWindow && capture.WindowCaptureSupported() {
+		// A window is captured through PrintWindow instead of as a rectangle
+		// of the composited desktop: only that window's own pixels are sent,
+		// even when another window covers it. The frames travel over a
+		// loopback TCP socket so ffmpeg's stdin stays free for its graceful
+		// "q" shutdown.
+		source, err := capture.NewWindowFrameSource(ctx, target.Window, cfg.Encoding.Resolution, cfg.Encoding.FPS, target.Cursor)
+		if err != nil {
+			r.logger.Warn("window capture is unavailable; falling back to the desktop region", "error", err)
+		} else {
+			grabber = capture.GrabberWindow
+			frameSource = source
+			inputOverride = &encode.InputOverride{
+				Args:    source.InputArgs(),
+				Filters: capture.WindowFilters(cfg.Encoding.Resolution),
+			}
+		}
+	}
+
+	// Validate the whole input here rather than leaving it to encode.Start:
+	// this is the point where a monitor with no DXGI output, an empty window
+	// rectangle or a rejected filter has to be reported, before anything is
+	// torn down.
+	if err := encode.ValidateInput(cfg, target, encoder, capabilities, inputOverride); err != nil {
+		if frameSource != nil {
+			_ = frameSource.Close()
+		}
+		return preparedCapture{}, err
+	}
+
+	return preparedCapture{
+		target:       target,
+		grabber:      grabber,
+		capabilities: capabilities,
+		input:        inputOverride,
+		frameSource:  frameSource,
+	}, nil
+}
+
 // startCapture resolves a target and brings one ffmpeg process up for it.
 //
 // Start and the auto switch both use it, which is why it does not touch the
 // shared cancel function or the watcher.
-func (r *Recorder) startCapture(ctx context.Context, cfg config.Config, ffmpeg encode.FFmpeg, encoder encode.Encoder, announce bool) (Session, error) {
-	capabilities := r.capabilities(ctx, ffmpeg, cfg)
-
-	target, err := r.targetResolver().Resolve(ctx, cfg)
+func (r *Recorder) startCapture(ctx context.Context, cfg config.Config, ffmpeg encode.FFmpeg, encoder encode.Encoder, requested *capture.Target, announce bool) (Session, error) {
+	prepared, err := r.prepareCapture(ctx, cfg, ffmpeg, encoder, requested)
 	if err != nil {
 		return Session{}, err
 	}
-	grabber := target.ChooseGrabber(capabilities)
+	return r.startPrepared(ctx, cfg, ffmpeg, encoder, prepared, announce)
+}
+
+// startPrepared brings ffmpeg up for an input that prepareCapture has already
+// resolved and validated.
+func (r *Recorder) startPrepared(ctx context.Context, cfg config.Config, ffmpeg encode.FFmpeg, encoder encode.Encoder, prepared preparedCapture, announce bool) (Session, error) {
+	target, grabber := prepared.target, prepared.grabber
+	frameSource := prepared.frameSource
+	closeFrameSource := func() {
+		if frameSource != nil {
+			_ = frameSource.Close()
+		}
+	}
 
 	// Requirement 8 from the spec: always say which target was chosen and why.
 	// This line is the first thing to read when the wrong screen got recorded.
@@ -163,6 +273,7 @@ func (r *Recorder) startCapture(ctx context.Context, cfg config.Config, ffmpeg e
 
 	output, err := r.output()
 	if err != nil {
+		closeFrameSource()
 		return Session{}, err
 	}
 
@@ -171,22 +282,27 @@ func (r *Recorder) startCapture(ctx context.Context, cfg config.Config, ffmpeg e
 		Config:       cfg,
 		Target:       target,
 		Encoder:      encoder,
-		Capabilities: capabilities,
+		Capabilities: prepared.capabilities,
 		Output:       output,
+		Input:        prepared.input,
 		Logger:       r.logger,
 	})
 	if err != nil {
+		closeFrameSource()
 		return Session{}, err
 	}
 
 	if err := runner.WaitForStart(startupGrace); err != nil {
 		// It is already dead: tidy up and report why, rather than leaving a
 		// corpse behind and telling the user they are recording.
+		closeFrameSource()
 		_ = runner.Stop(context.Background())
 		return Session{}, fmt.Errorf("ffmpeg could not capture %s: %w", target.Describe(), err)
 	}
 
 	session := Session{}
+	targetCopy := target
+	session.Target = &targetCopy
 	if output.Pipe {
 		session.Label = "Streaming"
 		session.Description = fmt.Sprintf("Encoding %s with %s via %s to stdout",
@@ -209,6 +325,15 @@ func (r *Recorder) startCapture(ctx context.Context, cfg config.Config, ffmpeg e
 		pump = make(chan struct{})
 		go func() {
 			defer close(pump)
+			if r.opts.CloseStdout {
+				defer func() {
+					if closer, ok := r.opts.Stdout.(io.Closer); ok {
+						if err := closer.Close(); err != nil {
+							r.logger.Debug("closing the encoded stream writer", "error", err)
+						}
+					}
+				}()
+			}
 			if _, err := io.Copy(r.opts.Stdout, runner.Stdout()); err != nil && !errors.Is(err, io.EOF) {
 				r.logger.Debug("copying the encoded stream to the writer", "error", err)
 			}
@@ -219,8 +344,10 @@ func (r *Recorder) startCapture(ctx context.Context, cfg config.Config, ffmpeg e
 	r.runner = runner
 	r.target = target
 	r.encoder = encoder
+	r.cfg = cfg
 	r.session = session
 	r.pumpDone = pump
+	r.frameSource = frameSource
 	r.mu.Unlock()
 
 	if announce {
@@ -321,23 +448,39 @@ func (r *Recorder) Stop(ctx context.Context) error {
 	runner := r.runner
 	cancel := r.cancelRun
 	watcher := r.watcher
+	watchCancel := r.watchCancel
 	pump := r.pumpDone
 	session := r.session
+	frameSource := r.frameSource
 	r.runner = nil
 	r.cancelRun = nil
 	r.watcher = nil
+	r.watchCancel = nil
 	r.pumpDone = nil
+	r.frameSource = nil
 	r.session = Session{}
 	r.mu.Unlock()
 
 	if runner == nil {
+		if frameSource != nil {
+			_ = frameSource.Close()
+		}
 		return nil
+	}
+
+	// Closing the frame source first makes ffmpeg see the end of its input, so
+	// it can finish the file before the graceful "q" below.
+	if frameSource != nil {
+		_ = frameSource.Close()
 	}
 
 	// Stop the watcher first, so it cannot start a new capture while this one
 	// is being torn down. Cancelling the run context is what makes it exit.
 	if cancel != nil {
 		cancel()
+	}
+	if watchCancel != nil {
+		watchCancel()
 	}
 	if watcher != nil {
 		select {
@@ -378,26 +521,29 @@ func (r *Recorder) Session() Session {
 // and why this is off by default.
 func (r *Recorder) startWatcher(ctx context.Context, cfg config.Config, ffmpeg encode.FFmpeg, encoder encode.Encoder) {
 	done := make(chan struct{})
+	watchCtx, watchCancel := context.WithCancel(ctx)
 
 	r.mu.Lock()
 	r.watcher = done
+	r.watchCancel = watchCancel
 	current := r.target
 	r.mu.Unlock()
 
 	go func() {
 		defer close(done)
+		defer watchCancel()
 
 		ticker := time.NewTicker(switchPollInterval)
 		defer ticker.Stop()
 
 		for {
 			select {
-			case <-ctx.Done():
+			case <-watchCtx.Done():
 				return
 			case <-ticker.C:
 			}
 
-			target, err := r.targetResolver().Resolve(ctx, cfg)
+			target, err := r.targetResolver().Resolve(watchCtx, cfg)
 			if err != nil {
 				r.logger.Debug("auto switch: could not resolve a target", "error", err)
 				continue
@@ -409,10 +555,11 @@ func (r *Recorder) startWatcher(ctx context.Context, cfg config.Config, ffmpeg e
 			r.logger.Info("auto switching capture target",
 				"from", current.Describe(), "to", target.Describe(), "reason", target.Reason)
 
-			if err := r.switchTarget(ctx, cfg, ffmpeg, encoder); err != nil {
-				// A failed switch has already stopped the old capture, so it is
-				// reported loudly and the watcher gives up rather than
-				// thrashing.
+			if _, err := r.switchTo(watchCtx, cfg, ffmpeg, encoder, &target); err != nil {
+				// A switch that fails after the old capture was stopped leaves
+				// nothing running, so it is reported loudly and the watcher
+				// gives up rather than thrashing. A target rejected during
+				// preparation keeps the current capture alive.
 				r.logger.Error("auto switch failed", "error", err)
 				return
 			}
@@ -421,26 +568,111 @@ func (r *Recorder) startWatcher(ctx context.Context, cfg config.Config, ffmpeg e
 	}()
 }
 
-// switchTarget stops the current capture and starts one for the new target.
-func (r *Recorder) switchTarget(ctx context.Context, cfg config.Config, ffmpeg encode.FFmpeg, encoder encode.Encoder) error {
+// SwitchTarget changes what the running capture reads. It is what the picker
+// calls when the user clicks another window while already live: the room,
+// broadcaster and viewers stay exactly as they were, and only ffmpeg is
+// restarted around the new input.
+func (r *Recorder) SwitchTarget(ctx context.Context, target capture.Target) (Session, error) {
+	r.mu.Lock()
+	cfg, ffmpeg, encoder := r.cfg, r.ffmpeg, r.encoder
+	running := r.runner != nil
+	// A manual switch is an explicit choice. Stop the auto-switch watcher so
+	// it cannot immediately switch back to the focused window a second later.
+	watchCancel := r.watchCancel
+	r.watchCancel = nil
+	r.mu.Unlock()
+	if !running {
+		return Session{}, errors.New("no capture is running")
+	}
+	if watchCancel != nil {
+		watchCancel()
+	}
+	if ffmpeg.Path == "" {
+		var err error
+		ffmpeg, err = r.ensureFFmpeg(ctx, cfg)
+		if err != nil {
+			return Session{}, err
+		}
+	}
+	return r.switchTo(ctx, cfg, ffmpeg, encoder, &target)
+}
+
+// SwitchRejectedError reports a switch that failed before the running capture
+// was stopped. The existing stream is still live, so the caller must not tear
+// it down.
+type SwitchRejectedError struct {
+	Err error
+}
+
+func (e *SwitchRejectedError) Error() string { return e.Err.Error() }
+func (e *SwitchRejectedError) Unwrap() error { return e.Err }
+
+// switchTo stops the current capture and starts one for the new target.
+func (r *Recorder) switchTo(ctx context.Context, cfg config.Config, ffmpeg encode.FFmpeg, encoder encode.Encoder, requested *capture.Target) (Session, error) {
+	// Build and validate the replacement input before touching the running
+	// capture. A switch to an uncapturable target (a monitor with no DXGI
+	// output, a window that vanished) must fail here, while the old stream is
+	// still alive, instead of taking it down and leaving viewers with nothing.
+	prepared, err := r.prepareCapture(ctx, cfg, ffmpeg, encoder, requested)
+	if err != nil {
+		return Session{}, &SwitchRejectedError{Err: err}
+	}
+	closePrepared := func() {
+		if prepared.frameSource != nil {
+			_ = prepared.frameSource.Close()
+		}
+	}
+
+	// Start the NEW capture first. If it fails, the old capture is still running
+	// and we return SwitchRejectedError so the watcher knows not to tear down the stream.
+	captureCtx, captureCancel := context.WithCancel(context.WithoutCancel(ctx))
+	newSession, err := r.startPrepared(captureCtx, cfg, ffmpeg, encoder, prepared, false)
+	if err != nil {
+		captureCancel()
+		closePrepared()
+		return Session{}, &SwitchRejectedError{Err: err}
+	}
+
+	// New capture is healthy. Now stop the OLD capture.
 	r.mu.Lock()
 	old := r.runner
-	r.runner = nil
+	oldFrameSource := r.frameSource
+	oldPump := r.pumpDone
 	previous := r.session.LocalRecording
+
+	// Atomically swap to the new capture
+	r.runner = nil // will be set by startPrepared via r.mu.Lock inside
+	r.frameSource = nil
+	r.pumpDone = nil
+	r.cancelRun = captureCancel
+	r.session = newSession
 	r.mu.Unlock()
 
+	// Stop the old frame source before ffmpeg so it sees the end of its input
+	// instead of a stalled socket.
+	if oldFrameSource != nil {
+		if err := oldFrameSource.Close(); err != nil {
+			r.logger.Debug("closing the previous window frame source", "error", err)
+		}
+	}
 	if old != nil {
 		if err := old.Stop(ctx); err != nil {
 			r.logger.Warn("stopping the previous capture", "error", err)
 		}
 	}
-
-	session, err := r.startCapture(ctx, cfg, ffmpeg, encoder, false)
-	if err != nil {
-		return fmt.Errorf("previous recording is at %s: %w", previous, err)
+	if oldPump != nil {
+		select {
+		case <-oldPump:
+		case <-ctx.Done():
+			return Session{}, ctx.Err()
+		}
 	}
-	r.logger.Info("auto switch finished", "file", session.LocalRecording)
-	return nil
+
+	if previous != "" {
+		r.logger.Info("previous recording finished", "file", previous)
+	}
+	r.logger.Info("capture target switched", "target", newSession.Description)
+	return newSession, nil
 }
 
 // sameTarget reports whether two resolutions would capture the same pixels.

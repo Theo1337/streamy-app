@@ -27,20 +27,25 @@ type Options struct {
 // Setup builds the application logger. The returned closer is never nil and
 // must be called on shutdown so the log file is flushed.
 func Setup(opts Options) (*slog.Logger, func() error, error) {
-	writers := []io.Writer{os.Stderr}
-
 	file, err := openLogFile(opts.File)
 	if err != nil {
 		return nil, nil, err
 	}
-	if file != nil {
-		writers = append(writers, file)
+
+	var sink io.Writer
+	if file == nil {
+		sink = os.Stderr
+	} else {
+		// A GUI build has no usable stderr. io.MultiWriter stops at the first
+		// write error, which used to drop every line from the log file; the
+		// terminal is useful when there is one, so it stays best effort.
+		sink = teeWriter{console: os.Stderr, file: file}
 	}
 
 	// A TextHandler prints key=value pairs, which is easy to read in a
 	// terminal; swap it for slog.NewJSONHandler if you later ship logs
 	// somewhere that parses them.
-	handler := slog.NewTextHandler(io.MultiWriter(writers...), &slog.HandlerOptions{
+	handler := slog.NewTextHandler(sink, &slog.HandlerOptions{
 		Level: ParseLevel(opts.Level),
 	})
 
@@ -65,6 +70,21 @@ func ParseLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// teeWriter mirrors log lines to the terminal and the file. The terminal write
+// is best effort: a GUI build has no usable stderr, and the file must keep
+// receiving lines either way.
+type teeWriter struct {
+	console io.Writer
+	file    io.Writer
+}
+
+func (w teeWriter) Write(p []byte) (int, error) {
+	if w.console != nil {
+		_, _ = w.console.Write(p)
+	}
+	return w.file.Write(p)
 }
 
 func openLogFile(path string) (*os.File, error) {

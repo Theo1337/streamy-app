@@ -18,9 +18,17 @@ const (
 	GrabberDDAGrab Grabber = "ddagrab"
 
 	// GrabberGDigrab uses the GDI BitBlt path. It is slower, it cannot always
-	// see fullscreen games, and it is the fallback. It is also the only
-	// grabber that can target a single window.
+	// see fullscreen games, and it is the fallback. Windows are captured as the
+	// rectangle they occupy on the desktop, because grabbing a window by title
+	// hands back a black picture for every window Windows composites on the
+	// GPU (Chrome, Electron, most modern games).
 	GrabberGDigrab Grabber = "gdigrab"
+
+	// GrabberWindow is not an ffmpeg input at all: Go calls PrintWindow and
+	// feeds the resulting BGRA frames to ffmpeg over a loopback socket. It is
+	// the only mode that shows the streamed window's own pixels when another
+	// window is covering it, even for GPU-composited windows.
+	GrabberWindow Grabber = "window"
 )
 
 // Capabilities describes what the local ffmpeg can actually do. It is measured
@@ -34,14 +42,30 @@ type Capabilities struct {
 
 // ChooseGrabber picks the grabber to use for this target.
 func (t Target) ChooseGrabber(caps Capabilities) Grabber {
-	// ddagrab duplicates a whole output and has no concept of a single window.
-	if t.Kind == KindWindow {
+	if !caps.DDAGrab {
 		return GrabberGDigrab
 	}
-	if caps.DDAGrab {
-		return GrabberDDAGrab
+	// ddagrab can only address an output that was matched to ffmpeg's D3D11
+	// adapter. DXGIIndex is -1 when the monitor is driven by another graphics
+	// adapter, is detached, or could not be matched at all; pointing ddagrab
+	// at it would fail to build the input, so fall back to GDI for the whole
+	// monitor (including a window on it).
+	// This check must come BEFORE the window logic so that a monitor with
+	// DXGIIndex=-1 never incorrectly selects DDAGrab.
+	if t.Monitor.DXGIIndex < 0 {
+		return GrabberGDigrab
 	}
-	return GrabberGDigrab
+	if t.Kind == KindWindow {
+		// ddagrab duplicates a whole output and has no window mode, but the
+		// window's rectangle can be cropped out of that surface. Doing so is
+		// both cheaper than GDI and, unlike grabbing a window by title, it
+		// sees windows that are composited on the GPU.
+		if _, ok := t.windowRegion(); ok && t.Monitor.Rotation == 0 {
+			return GrabberDDAGrab
+		}
+		return GrabberGDigrab
+	}
+	return GrabberDDAGrab
 }
 
 // InputOptions tunes how the capture source is opened.
@@ -90,9 +114,17 @@ func (t Target) InputSpec(opts InputOptions) (InputSpec, error) {
 // ddagrab is a filter rather than a capture device, so it is attached to a
 // lavfi source. It also needs a D3D11 device to hand its textures to, hence the
 // `-init_hw_device d3d11va`, which is what makes `hwdownload` work afterwards.
+//
+// A window target is captured by duplicating the monitor under it and cropping
+// the window's rectangle out of the frame. Desktop Duplication hands out the
+// composited desktop, so this sees exactly what GDI's per-window BitBlt fails
+// to see: GPU-rendered windows, which otherwise come out black.
 func (t Target) ddagrabSpec(opts InputOptions) (InputSpec, error) {
-	if t.Kind != KindMonitor {
-		return InputSpec{}, errors.New("ddagrab can only capture a whole monitor")
+	if t.Kind != KindMonitor && t.Kind != KindWindow {
+		return InputSpec{}, fmt.Errorf("cannot capture a %s with ddagrab", t.Kind)
+	}
+	if t.Monitor.DXGIIndex < 0 {
+		return InputSpec{}, errors.New("monitor has no known DXGI output")
 	}
 
 	args := []string{
@@ -106,6 +138,26 @@ func (t Target) ddagrabSpec(opts InputOptions) (InputSpec, error) {
 	// ordinary filter can touch them. `format=bgra` names the layout ddagrab
 	// produces; from there ffmpeg converts to whatever the encoder wants.
 	filters := []string{"hwdownload", "format=bgra"}
+	if t.Kind == KindWindow {
+		region, ok := t.windowRegion()
+		if !ok {
+			return InputSpec{}, errors.New("window is not on a known monitor, so it cannot be cropped out of a duplicated output")
+		}
+		// A rotated output arrives unrotated, so a rectangle in the desktop's
+		// coordinates cannot be mapped onto it with a plain crop.
+		if t.Monitor.Rotation != 0 {
+			return InputSpec{}, errors.New("cannot crop a window from a rotated monitor with ddagrab")
+		}
+		x := region.X - t.Monitor.Bounds.X
+		y := region.Y - t.Monitor.Bounds.Y
+		if region.Width < 2 || region.Height < 2 {
+			return InputSpec{}, errors.New("window is almost entirely off screen, so there is nothing to crop")
+		}
+		filters = append(filters, fmt.Sprintf("crop=%d:%d:%d:%d", region.Width, region.Height, x, y))
+		// Window rectangles are arbitrary; H.264's 4:2:0 chroma needs even
+		// dimensions, so round down before the encoder sees the frame.
+		filters = append(filters, "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+	}
 	filters = append(filters, rotationFilters(t.Monitor.Rotation)...)
 	filters = append(filters, scaleFilters(opts.Scale)...)
 
@@ -120,42 +172,75 @@ func (t Target) gdigrabSpec(opts InputOptions) (InputSpec, error) {
 		if b.Empty() {
 			return InputSpec{}, errors.New("monitor has an empty rectangle")
 		}
-		args := []string{
-			"-f", "gdigrab",
-			"-framerate", strconv.Itoa(opts.FPS),
-			"-draw_mouse", strconv.Itoa(boolToInt(opts.DrawMouse)),
-			// GDI grabs a rectangle of the whole virtual desktop, so the
-			// monitor is selected purely by offset and size. That is why this
-			// path needs no DXGI index at all.
-			"-offset_x", strconv.Itoa(b.X),
-			"-offset_y", strconv.Itoa(b.Y),
-			"-video_size", fmt.Sprintf("%dx%d", b.Width, b.Height),
-			"-i", "desktop",
-		}
-		// No rotation filter here: GDI reads the composited desktop, which DWM
-		// has already rotated the way the user sees it, and so the frame comes
-		// out portrait for a portrait monitor — the opposite of ddagrab.
-		return InputSpec{Args: args, Filters: strings.Join(scaleFilters(opts.Scale), ","), Grabber: GrabberGDigrab}, nil
+		return InputSpec{
+			Args:    gdigrabDesktopArgs(b, opts),
+			Filters: strings.Join(scaleFilters(opts.Scale), ","),
+			Grabber: GrabberGDigrab,
+		}, nil
 
 	case KindWindow:
-		title := strings.TrimSpace(t.Window.Title)
-		if title == "" {
-			return InputSpec{}, errors.New("window has no title to match on")
+		// GDI can select a window by title, but that path shares the window's
+		// own drawing surface and returns black for anything the GPU
+		// composites. The desktop rectangle the window occupies does not have
+		// that problem, so a window is captured as a region of the screen.
+		// The cost is that a window which is covered by another window shows
+		// the covering window instead of its own (invisible) pixels.
+		region, ok := t.windowRegion()
+		if !ok {
+			// Without a monitor snapshot the rectangle is still usable: GDI
+			// addresses the virtual desktop by offset and size, and does not
+			// need to know which monitor the window is on.
+			region = t.Window.Rect
 		}
-		// gdigrab selects a window by title, matched case insensitively and
-		// allowing a partial match. The title needs ffmpeg's own escaping
-		// because `:` separates options inside an input specification.
-		args := []string{
-			"-f", "gdigrab",
-			"-framerate", strconv.Itoa(opts.FPS),
-			"-draw_mouse", strconv.Itoa(boolToInt(opts.DrawMouse)),
-			"-i", "title=" + escapeFFmpegValue(title),
+		if region.Empty() {
+			return InputSpec{}, errors.New("window has an empty rectangle, so there is nothing to capture")
 		}
-		return InputSpec{Args: args, Filters: strings.Join(scaleFilters(opts.Scale), ","), Grabber: GrabberGDigrab}, nil
+		if region.Width < 2 || region.Height < 2 {
+			return InputSpec{}, errors.New("window is almost entirely off screen, so there is nothing to capture")
+		}
+		return InputSpec{
+			Args:    gdigrabDesktopArgs(region, opts),
+			Filters: strings.Join(windowRegionFilters(opts.Scale), ","),
+			Grabber: GrabberGDigrab,
+		}, nil
 
 	default:
 		return InputSpec{}, fmt.Errorf("cannot capture a %s", t.Kind)
 	}
+}
+
+// gdigrabDesktopArgs opens a rectangle of the composited desktop.
+//
+// GDI grabs the whole virtual desktop, so the region is selected purely by
+// offset and size. No rotation filter is applied: GDI reads the desktop the way
+// DWM has already rotated it, which is the opposite of ddagrab.
+func gdigrabDesktopArgs(b Rect, opts InputOptions) []string {
+	args := []string{
+		"-f", "gdigrab",
+		"-framerate", strconv.Itoa(opts.FPS),
+		"-draw_mouse", strconv.Itoa(boolToInt(opts.DrawMouse)),
+		"-offset_x", strconv.Itoa(b.X),
+		"-offset_y", strconv.Itoa(b.Y),
+		"-video_size", fmt.Sprintf("%dx%d", b.Width, b.Height),
+		"-i", "desktop",
+	}
+	return args
+}
+
+// windowRegionFilters rounds a window's arbitrary size down to the even
+// dimensions H.264's 4:2:0 chroma requires.
+func windowRegionFilters(scale string) []string {
+	filters := []string{"scale=trunc(iw/2)*2:trunc(ih/2)*2"}
+	return append(filters, scaleFilters(scale)...)
+}
+
+// WindowFilters is the filter chain used by the PrintWindow frame source. The
+// source already fits inside the configured resolution and produces even
+// dimensions, so it must not be scaled up to the display resolution: a 900x700
+// window stays 900x700 (rounded down) instead of being blown up to 1080p and
+// costing CPU for no extra detail.
+func WindowFilters(string) string {
+	return "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 }
 
 // rotationFilters turns a display rotation into transpose filters.

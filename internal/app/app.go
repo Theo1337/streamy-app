@@ -8,16 +8,23 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"streamy/internal/capture"
 	"streamy/internal/clipboard"
 	"streamy/internal/config"
+	"streamy/internal/executil"
 	"streamy/internal/hotkey"
+	"streamy/internal/output"
 	"streamy/internal/pipeline"
+	"streamy/internal/sound"
+	"streamy/internal/stack"
 	"streamy/internal/tray"
 	"streamy/internal/version"
 )
@@ -68,19 +75,31 @@ type Options struct {
 
 // App is the long lived background process.
 type App struct {
-	logger   *slog.Logger
-	cfg      config.Config
-	cfgPath  string
-	streamer pipeline.Streamer
-	hotkeys  *hotkey.Manager
-	tray     *tray.Tray
+	logger        *slog.Logger
+	cfg           config.Config
+	cfgPath       string
+	streamer      pipeline.Streamer
+	hotkeys       *hotkey.Manager
+	pickerHotkeys *hotkey.Manager
+	tray          *tray.Tray
+	stack         *stack.Manager
 
 	// mu guards the state below. Everything that touches them goes through a
 	// short critical section and then calls refresh() outside of it, because
 	// refresh takes the same lock in Status().
-	mu      sync.Mutex
-	state   State
-	session pipeline.Session
+	mu                  sync.Mutex
+	state               State
+	session             pipeline.Session
+	ipc                 *ipcServer
+	configMu            sync.Mutex
+	uiProcesses         map[*exec.Cmd]chan struct{}
+	activeTarget        *capture.Target
+	lastInteraction     time.Time
+	shuttingDown        bool
+	identityToken       string
+	identityProfile     discordProfile
+	identityError       string
+	pendingDiscordState string
 
 	// copyToClipboard is a field rather than a direct call so tests can
 	// substitute it: a unit test must not overwrite the real clipboard.
@@ -117,10 +136,14 @@ func New(opts Options) (*App, error) {
 		cfgPath:         opts.ConfigPath,
 		streamer:        streamer,
 		hotkeys:         hotkey.NewManager(logger),
+		pickerHotkeys:   hotkey.NewManager(logger),
+		stack:           stack.New(logger, opts.Config.Stream.Stack, opts.Config.Stream.Discord.NotifyURL, opts.Config.Stream.Discord.NotifyKey),
 		state:           StateIdle,
 		copyToClipboard: clipboard.WriteText,
 		timeout:         timeout,
 		quitCh:          make(chan struct{}),
+		uiProcesses:     make(map[*exec.Cmd]chan struct{}),
+		lastInteraction: time.Now(),
 	}
 
 	if !opts.Headless {
@@ -131,6 +154,18 @@ func New(opts Options) (*App, error) {
 			OnReady:    a.onReady,
 		})
 	}
+	token, identityErr := loadDiscordIdentity()
+	if identityErr != nil {
+		a.identityError = identityErr.Error()
+	} else if token != "" {
+		profile, err := parseDiscordIdentity(token)
+		if err != nil {
+			a.identityError = "Saved Discord sign-in is invalid or expired. Connect Discord again."
+		} else {
+			a.identityToken = token
+			a.identityProfile = profile
+		}
+	}
 	return a, nil
 }
 
@@ -138,7 +173,14 @@ func New(opts Options) (*App, error) {
 func (a *App) Config() config.Config {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.cfg
+	cfg := a.cfg
+	cfg.Stream.STUNServers = append([]string(nil), cfg.Stream.STUNServers...)
+	cfg.Stream.TURNServers = append([]config.TURNServer(nil), cfg.Stream.TURNServers...)
+	for i := range cfg.Stream.TURNServers {
+		cfg.Stream.TURNServers[i].URLs = append([]string(nil), cfg.Stream.TURNServers[i].URLs...)
+	}
+	cfg.Encoding.ExtraEncoderArgs = append([]string(nil), cfg.Encoding.ExtraEncoderArgs...)
+	return cfg
 }
 
 // Run starts everything and blocks until the app quits. Shutdown always runs,
@@ -171,25 +213,38 @@ func (a *App) onReady() error {
 		"config", a.cfgPath,
 		"pid", os.Getpid(),
 	)
+	if err := a.startIPC(); err != nil {
+		a.logger.Error("settings IPC is unavailable", "error", err)
+	} else {
+		a.logger.Info("settings IPC ready")
+	}
+	if a.cfg.RunAtStartup {
+		if err := setRunAtStartup(true, a.cfgPath); err != nil {
+			a.logger.Error("could not update Windows startup setting", "error", err)
+			a.notify("Startup setting unavailable", err.Error())
+		}
+	}
 
 	go a.watchHotkeys()
+	go a.watchBotIdle()
 
-	if a.cfg.Hotkey.Enabled {
-		if err := a.hotkeys.Register(a.cfg.Hotkey.Toggle); err != nil {
-			// Not fatal: the tray menu still works. The usual cause is another
-			// application owning the same combination, so point at the config.
-			a.logger.Error("global hotkey unavailable",
-				"shortcut", a.cfg.Hotkey.Toggle, "error", err)
-			a.notify("Hotkey unavailable",
-				fmt.Sprintf("Could not use %s: %v\nStart capturing from the tray menu, or change hotkey.toggle in:\n%s",
-					a.cfg.Hotkey.Toggle, err, a.cfgPath))
-		}
-	} else {
-		a.logger.Info("global hotkey disabled in settings")
+	// The local bot is only useful when it can post the public viewer link.
+	if a.shouldStartBot(a.cfg) {
+		a.stack.Start()
+	}
+
+	if err := a.registerHotkeys(a.cfg.Hotkey); err != nil {
+		a.logger.Error("global hotkeys unavailable", "error", err)
+		a.notify("Hotkey unavailable", fmt.Sprintf("%v\nChange the shortcuts in:\n%s", err, a.cfgPath))
+	} else if !a.cfg.Hotkey.Enabled {
+		a.logger.Info("global hotkeys disabled in settings")
 	}
 
 	a.refresh()
 	a.notify("Streamy is running", fmt.Sprintf("Press %s to start capturing.", a.cfg.Hotkey.Toggle))
+	if a.tray != nil && !a.cfg.SetupComplete {
+		a.OpenSettings()
+	}
 	return nil
 }
 
@@ -204,7 +259,50 @@ func (a *App) watchHotkeys() {
 				return
 			}
 			a.ToggleSharing()
+		case _, ok := <-a.pickerHotkeys.Events():
+			if !ok {
+				return
+			}
+			a.OpenPicker()
 		}
+	}
+}
+
+// touchInteraction postpones the ten-minute idle shutdown when the user
+// explicitly opens a window, picks a target or saves settings. Background status
+// polling deliberately does not call it, so a forgotten open window still lets
+// the bot go quiet.
+func (a *App) touchInteraction() {
+	a.mu.Lock()
+	a.lastInteraction = time.Now()
+	a.mu.Unlock()
+}
+
+// watchBotIdle stops the local bot after ten quiet minutes. Starting a stream
+// or opening a window resets the timer, and the next stream starts it again
+// lazily. This keeps a tray app that may sit unused all day from pinning a bot
+// process in the background.
+func (a *App) watchBotIdle() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.quitCh:
+			return
+		case <-ticker.C:
+		}
+		a.mu.Lock()
+		idle := a.state == StateIdle && a.stack.Running() && time.Since(a.lastInteraction) >= 10*time.Minute
+		a.mu.Unlock()
+		if !idle {
+			continue
+		}
+		a.logger.Info("stopping the local Discord bot after ten idle minutes")
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if err := a.stack.Stop(ctx); err != nil {
+			a.logger.Warn("could not stop the idle local bot", "error", err)
+		}
+		cancel()
 	}
 }
 
@@ -212,11 +310,23 @@ func (a *App) watchHotkeys() {
 func (a *App) Status() tray.Status {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	var target *tray.Target
+	if a.activeTarget != nil {
+		target = &tray.Target{
+			Kind:   a.activeTarget.Kind.String(),
+			Index:  a.activeTarget.Monitor.Index,
+			Handle: fmt.Sprintf("%d", a.activeTarget.Window.Handle),
+		}
+		if a.activeTarget.Kind == capture.KindWindow {
+			target.Index = 0
+		}
+	}
 	return tray.Status{
 		Sharing:   a.state == StateStreaming,
 		ViewerURL: a.session.ViewerURL,
 		Text:      a.statusTextLocked(),
 		Active:    a.session.Label,
+		Target:    target,
 	}
 }
 
@@ -241,7 +351,7 @@ func (a *App) ToggleSharing() {
 	case StateStreaming:
 		a.stopSharing()
 	case StateIdle:
-		a.startSharing()
+		a.startSharing(nil)
 	default:
 		// Starting or stopping: a second press this fast is almost certainly
 		// the user being impatient, so ignore it instead of queueing a stop.
@@ -249,23 +359,40 @@ func (a *App) ToggleSharing() {
 	}
 }
 
-func (a *App) startSharing() {
+func (a *App) startSharing(target *capture.Target) {
 	a.mu.Lock()
 	if a.state != StateIdle {
 		a.mu.Unlock()
 		return
 	}
+	if target == nil && a.cfg.Capture.AlwaysShowPicker {
+		a.mu.Unlock()
+		a.OpenPicker()
+		return
+	}
 	a.state = StateStarting
+	cfg := a.cfg
+	identityToken := a.identityToken
+	identityName := a.identityProfile.Name
 	a.mu.Unlock()
 	a.refresh()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	session, err := a.streamer.Start(ctx, pipeline.Request{Config: a.cfg})
+	// Make sure the local bot is on its way. Waiting for it would block the
+	// hotkey; the notification is best effort and the bot starts in parallel.
+	if a.shouldStartBot(cfg) {
+		a.stack.Start()
+	}
+
+	session, err := a.streamer.Start(ctx, pipeline.Request{
+		Config: cfg, Target: target, IdentityToken: identityToken, UserName: identityName,
+	})
 	if err != nil {
 		a.mu.Lock()
 		a.state, a.session = StateIdle, pipeline.Session{}
+		a.activeTarget = nil
 		a.mu.Unlock()
 		a.refresh()
 
@@ -284,14 +411,17 @@ func (a *App) startSharing() {
 
 	a.mu.Lock()
 	a.state, a.session = StateStreaming, session
+	a.activeTarget = session.Target
+	a.lastInteraction = time.Now()
 	a.mu.Unlock()
 	a.refresh()
 
 	a.logger.Info("session started",
 		"label", session.Label,
 		"description", session.Description,
-		"viewer", session.ViewerURL,
+		"viewer_origin", redactViewerURL(session.ViewerURL),
 	)
+	sound.PlayStart()
 
 	// Copying the link is a nicety: if the clipboard is locked by another
 	// process we still record, we just say so.
@@ -303,6 +433,105 @@ func (a *App) startSharing() {
 		}
 	}
 	a.announce(session, copyErr)
+}
+
+// SwitchSharing retargets a live stream when the picker selects a different
+// window or display. Starting from idle is allowed too, which keeps the picker
+// code to one path.
+func (a *App) SwitchSharing(target capture.Target) error {
+	a.mu.Lock()
+	state := a.state
+	a.mu.Unlock()
+	if state == StateIdle {
+		a.startSharing(&target)
+		return nil
+	}
+	if state != StateStreaming {
+		return errors.New("the stream is busy starting or stopping")
+	}
+
+	a.mu.Lock()
+	a.state = StateStarting
+	a.lastInteraction = time.Now()
+	a.mu.Unlock()
+	a.refresh()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	session, err := a.streamer.SwitchTarget(ctx, target)
+	if err != nil {
+		a.logger.Error("could not switch the stream target", "error", err)
+		a.mu.Lock()
+		a.state = StateStreaming
+		a.mu.Unlock()
+		a.refresh()
+		var rejected *pipeline.SwitchRejectedError
+		if errors.As(err, &rejected) {
+			// The target was rejected before ffmpeg was restarted, so the
+			// current capture is still running and viewers stay connected.
+			a.notify("Could not switch the stream", "The current target is still live. "+err.Error())
+			return err
+		}
+		a.notify("Could not switch the stream", err.Error())
+		// The old capture has already stopped, so leaving the room "live"
+		// would show a frozen frame forever.
+		go a.stopSharing()
+		return err
+	}
+
+	a.mu.Lock()
+	a.state = StateStreaming
+	targetCopy := target
+	session.Target = &targetCopy
+	a.session = session
+	a.activeTarget = &targetCopy
+	a.mu.Unlock()
+	a.refresh()
+	a.logger.Info("stream target switched", "target", target.Describe())
+	a.notify("Stream switched", target.Describe())
+	return nil
+}
+
+// shouldStartBot decides whether the local Discord bot should run. It is only
+// useful when notifications are configured. An explicit script is still a
+// valid way to point at a development launcher; otherwise the built-in
+// `streamy bot` subcommand is used.
+func (a *App) shouldStartBot(cfg config.Config) bool {
+	if !cfg.Stream.Stack.AutoStart {
+		return false
+	}
+	return strings.TrimSpace(cfg.Stream.Stack.Script) != "" ||
+		strings.TrimSpace(cfg.Stream.Discord.NotifyURL) != ""
+}
+
+// notifyBotStopped removes the bot's live link. It is best effort: a bot outage
+// must never make stopping a stream slow or fail.
+func (a *App) notifyBotStopped(ctx context.Context, cfg config.Config) {
+	discord := cfg.Stream.Discord
+	if discord.NotifyURL == "" {
+		return
+	}
+	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := output.NotifyBotStop(notifyCtx, discord.NotifyURL, discord.NotifyKey, output.BotNotice{
+		ChannelID: discord.ChannelID,
+	}); err != nil {
+		a.logger.Warn("could not remove the Discord live link", "error", err)
+	}
+}
+
+func redactViewerURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "[invalid URL]"
+	}
+	if parsed.Host != "" {
+		return parsed.Scheme + "://" + parsed.Host
+	}
+	return parsed.Scheme + ":"
 }
 
 // announce reports a started session to the user.
@@ -349,6 +578,7 @@ func (a *App) stopSharing() {
 		return
 	}
 	a.state = StateStopping
+	cfg := a.cfg
 	a.mu.Unlock()
 	a.refresh()
 
@@ -359,49 +589,124 @@ func (a *App) stopSharing() {
 		a.logger.Error("problem stopping the capture", "error", err)
 		a.notify("Problem stopping", err.Error())
 	}
+	// Do not make the tray wait on Discord; the bot call is best effort.
+	go a.notifyBotStopped(ctx, cfg)
 
 	a.mu.Lock()
 	a.state, a.session = StateIdle, pipeline.Session{}
+	a.activeTarget = nil
+	a.lastInteraction = time.Now()
 	a.mu.Unlock()
 	a.refresh()
+	sound.PlayStop()
 
 	a.logger.Info("session stopped")
 }
 
-// OpenSettings launches the settings window.
-//
-// Wails arrives in phase 6 and will be a separate executable next to this one
-// (systray does not play nicely with a webview on the same thread). Until then
-// this reports where the config file is.
-func (a *App) OpenSettings() {
-	if path := a.uiExecutable(); path != "" {
-		cmd := exec.Command(path)
-		if err := cmd.Start(); err != nil {
-			a.logger.Error("could not launch the settings UI", "path", path, "error", err)
-			a.notify("Could not open settings", err.Error())
-			return
-		}
-		// Reap the child so it does not stay a zombie if it exits on its own.
-		go func() { _ = cmd.Wait() }()
-		a.logger.Info("settings UI launched", "path", path)
+// OpenSettings launches the settings window (sidebar, no capture picker).
+func (a *App) OpenSettings() { a.openUI("settings") }
+
+// OpenPicker launches the full-window capture picker. It deliberately has no
+// sidebar, so choosing a window stays one click away.
+func (a *App) OpenPicker() { a.openUI("share") }
+
+func (a *App) openUI(view string) {
+	path := a.uiExecutable()
+	if path == "" {
+		a.logger.Info("settings UI is not installed", "config", a.cfgPath)
+		a.notify("Settings UI not found", "Build streamy-ui.exe and place it beside Streamy.\nFor now, edit:\n"+a.cfgPath)
 		return
 	}
 
-	a.logger.Info("settings window not built yet", "phase", 6, "config", a.cfgPath)
-	a.notify("Settings", "The settings window arrives in phase 6.\nFor now, edit:\n"+a.cfgPath)
+	a.mu.Lock()
+	ipc := a.ipc
+	if a.shuttingDown || ipc == nil {
+		a.mu.Unlock()
+		if ipc == nil {
+			a.notify("Settings unavailable", "The local settings connection is not running.")
+		}
+		return
+	}
+	a.lastInteraction = time.Now()
+	a.mu.Unlock()
+
+	cmd := exec.Command(path, "-ipc-address", ipc.address, "-ipc-token", ipc.token, "-view", view)
+	// The settings UI is a Wails window. A console-subsystem build would
+	// otherwise flash a terminal, but HideConsoleWindow's SW_HIDE would also
+	// hide the first ShowWindow call. NoConsoleWindow suppresses only the
+	// terminal.
+	executil.NoConsoleWindow(cmd)
+	if err := cmd.Start(); err != nil {
+		a.logger.Error("could not launch the settings UI", "path", path, "error", err)
+		a.notify("Could not open settings", err.Error())
+		return
+	}
+
+	done := make(chan struct{})
+	a.mu.Lock()
+	if a.shuttingDown || a.ipc != ipc {
+		a.mu.Unlock()
+		_ = cmd.Process.Kill()
+		close(done)
+		return
+	}
+	a.uiProcesses[cmd] = done
+	a.mu.Unlock()
+
+	// Reap the child so it does not stay a zombie if it exits on its own.
+	go func() {
+		waitErr := cmd.Wait()
+		a.mu.Lock()
+		delete(a.uiProcesses, cmd)
+		expectedShutdown := a.shuttingDown
+		a.mu.Unlock()
+		close(done)
+		if waitErr != nil && !errors.Is(waitErr, os.ErrProcessDone) && !expectedShutdown {
+			a.logger.Warn("settings UI exited with an error", "error", waitErr)
+		}
+	}()
+	a.logger.Info("settings UI launched", "path", path, "view", view)
 }
 
 // uiExecutable returns the path of the Wails UI next to this binary, or "".
 func (a *App) uiExecutable() string {
 	self, err := os.Executable()
 	if err != nil {
+		a.logger.Warn("could not resolve tray executable path", "error", err)
 		return ""
 	}
-	candidate := filepath.Join(filepath.Dir(self), "streamy-ui.exe")
-	if _, err := os.Stat(candidate); err != nil {
+	workingDir, err := os.Getwd()
+	if err != nil {
+		a.logger.Warn("could not resolve current working directory", "error", err)
+	}
+	if workingDir == "" {
 		return ""
 	}
-	return candidate
+	return findUIExecutable(self, workingDir)
+}
+
+func findUIExecutable(self, workingDir string) string {
+	sibling := filepath.Join(filepath.Dir(self), "streamy-ui.exe")
+	if isFile(sibling) {
+		return sibling
+	}
+
+	// `go run` puts the tray executable in a temporary directory. In a
+	// development checkout, find the UI built by build.ps1 relative to the
+	// module root instead of incorrectly reporting it as missing.
+	if isFile(filepath.Join(workingDir, "go.mod")) &&
+		isFile(filepath.Join(workingDir, "ui", "main.go")) {
+		candidate := filepath.Join(workingDir, "out", "bin", "streamy-ui.exe")
+		if isFile(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func isFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // CopyViewerLink implements tray.Controller.
@@ -437,17 +742,45 @@ func (a *App) Quit() {
 // context (not the cancelled one) is deliberate: cleanup needs to be able to
 // wait even though the run context is already done.
 func (a *App) shutdown(ctx context.Context) error {
+	a.quitOnce.Do(func() { close(a.quitCh) })
+	a.mu.Lock()
+	a.shuttingDown = true
+	uiProcesses := make([]*exec.Cmd, 0, len(a.uiProcesses))
+	uiDones := make([]chan struct{}, 0, len(a.uiProcesses))
+	for cmd, done := range a.uiProcesses {
+		uiProcesses = append(uiProcesses, cmd)
+		uiDones = append(uiDones, done)
+	}
+	cfg := a.cfg
+	a.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
 
 	var errs []error
+	for _, cmd := range uiProcesses {
+		if cmd.Process != nil {
+			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				errs = append(errs, fmt.Errorf("close settings UI: %w", err))
+			}
+		}
+	}
+	for _, done := range uiDones {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			errs = append(errs, fmt.Errorf("wait for settings UI to close: %w", ctx.Err()))
+		}
+	}
 
 	if err := a.hotkeys.Unregister(); err != nil {
 		errs = append(errs, err)
 	}
+	if err := a.pickerHotkeys.Unregister(); err != nil {
+		errs = append(errs, err)
+	}
 
 	a.mu.Lock()
-	wasActive := a.state == StateStreaming || a.state == StateStarting
+	wasActive := a.state == StateStreaming || a.state == StateStarting || a.state == StateStopping
 	a.state, a.session = StateIdle, pipeline.Session{}
 	a.mu.Unlock()
 
@@ -455,6 +788,13 @@ func (a *App) shutdown(ctx context.Context) error {
 		if err := a.streamer.Stop(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("stop streamer: %w", err))
 		}
+		a.notifyBotStopped(ctx, cfg)
+	}
+	if err := a.stopIPC(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("stop settings IPC: %w", err))
+	}
+	if err := a.stack.Stop(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("stop local bot: %w", err))
 	}
 
 	a.logger.Info("streamy stopped")

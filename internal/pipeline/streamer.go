@@ -12,11 +12,13 @@ import (
 	"errors"
 	"log/slog"
 
+	"streamy/internal/capture"
 	"streamy/internal/config"
 )
 
 // Streamer is the capture -> encode -> output pipeline behind one pair of
-// methods.
+// methods. The live streamer is used by the tray; Recorder remains available
+// for diagnostics and record-only runs.
 //
 // Defining it here rather than in app means the package that implements it also
 // owns the contract, and app only has to depend on this package. Phase 3 adds
@@ -29,18 +31,29 @@ type Streamer interface {
 	// Stop tears the pipeline down. It must be safe to call when nothing is
 	// running, and it must leave no ffmpeg process behind.
 	Stop(ctx context.Context) error
+
+	// SwitchTarget changes what is being captured without closing the live
+	// session. Viewers keep the same link and connection; the encoder starts a
+	// new stream and the broadcaster requests a keyframe.
+	SwitchTarget(ctx context.Context, target capture.Target) (Session, error)
 }
 
 // Request is everything a Streamer needs to start.
 type Request struct {
 	// Config is a snapshot of the settings to use.
 	Config config.Config
+	// Target, when set, is an explicit choice from the on-demand picker.
+	Target *capture.Target
+	// IdentityToken is a Worker-signed Discord host identity.
+	IdentityToken string
+	// UserName is the Discord display name the bot puts in its message.
+	UserName string
 }
 
 // Session describes a running pipeline.
 type Session struct {
-	// ViewerURL is the link to hand to whoever wants to watch. Phase 3 puts the
-	// viewer page's room link here. Phase 2 puts a file:// URL to the recording
+	// ViewerURL is the link to hand to whoever wants to watch. The live streamer
+	// puts the room link here. Recorder puts a file:// URL to the recording
 	// here instead of a placeholder or an empty string, because that link
 	// really does open the thing that is being recorded.
 	ViewerURL string
@@ -49,12 +62,15 @@ type Session struct {
 	// recording to disk.
 	LocalRecording string
 
-	// Label is a short word for the tray: "Recording", later "Sharing".
+	// Label is a short word for the tray: "Sharing" or "Recording".
 	Label string
 
 	// Description is one sentence for the notification: what is being captured,
 	// and where it is going.
 	Description string
+	// Target is the resolved capture target, so the picker can mark the live
+	// card even when the stream was started from the hotkey.
+	Target *capture.Target
 }
 
 // ErrNotImplemented marks a Streamer that is still a placeholder.
@@ -81,3 +97,8 @@ func (s *Stub) Start(context.Context, Request) (Session, error) {
 
 // Stop does nothing, and is happy about it.
 func (s *Stub) Stop(context.Context) error { return nil }
+
+// SwitchTarget is only meaningful for a running pipeline.
+func (s *Stub) SwitchTarget(context.Context, capture.Target) (Session, error) {
+	return Session{}, ErrNotImplemented
+}

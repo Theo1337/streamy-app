@@ -45,20 +45,39 @@ func (o Output) FormatOrDefault() string {
 // then encoder settings, then the output. Encoder settings have to come after
 // the input because some of them are resolved against the input's pixel format.
 func Args(cfg config.Config, target capture.Target, enc Encoder, caps capture.Capabilities, out Output) ([]string, error) {
+	return ArgsWithInput(cfg, target, enc, caps, out, nil)
+}
+
+// InputOverride replaces the target-derived ffmpeg input. Window capture uses
+// it because its frames come from Go over a loopback socket rather than from
+// ddagrab or gdigrab.
+type InputOverride struct {
+	Args    []string
+	Filters string
+}
+
+// ArgsWithInput is Args with an optional pre-built input.
+func ArgsWithInput(cfg config.Config, target capture.Target, enc Encoder, caps capture.Capabilities, out Output, override *InputOverride) ([]string, error) {
 	fps := cfg.Encoding.FPS
 	if fps <= 0 {
 		fps = 30
 	}
 
-	grabber := target.ChooseGrabber(caps)
-	input, err := target.InputSpec(capture.InputOptions{
-		Grabber:   grabber,
-		FPS:       fps,
-		DrawMouse: cfg.Capture.CaptureCursor,
-		Scale:     resolutionScale(cfg.Encoding.Resolution),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("build capture input for %s: %w", target.Describe(), err)
+	var input InputOverride
+	if override != nil {
+		input = *override
+	} else {
+		grabber := target.ChooseGrabber(caps)
+		spec, err := target.InputSpec(capture.InputOptions{
+			Grabber:   grabber,
+			FPS:       fps,
+			DrawMouse: cfg.Capture.CaptureCursor,
+			Scale:     resolutionScale(cfg.Encoding.Resolution),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("build capture input for %s: %w", target.Describe(), err)
+		}
+		input = InputOverride{Args: spec.Args, Filters: spec.Filters}
 	}
 
 	args := []string{
@@ -70,8 +89,8 @@ func Args(cfg config.Config, target capture.Target, enc Encoder, caps capture.Ca
 		"-loglevel", ffmpegLogLevel(cfg.LogLevel),
 	}
 	args = append(args, input.Args...)
-	// Phase 2 records video only. Audio arrives in phase 5, and saying so
-	// explicitly keeps ffmpeg from picking up a default audio device.
+	// Keep the screen-capture process video-only. Desktop audio uses a separate
+	// WASAPI loopback process and is sent as RTP to the shared WebRTC audio track.
 	args = append(args, "-an")
 	if input.Filters != "" {
 		args = append(args, "-vf", input.Filters)
@@ -160,6 +179,16 @@ func videoArgs(cfg config.Config, enc Encoder, fps int) []string {
 
 	args = append(args, cfg.Encoding.ExtraEncoderArgs...)
 	return args
+}
+
+// ValidateInput builds the ffmpeg input for a target without starting ffmpeg.
+//
+// A switch prepares the next input before stopping the current capture, so a
+// target that cannot be captured (for example a monitor with no DXGI output)
+// fails the switch instead of taking a healthy stream down with it.
+func ValidateInput(cfg config.Config, target capture.Target, enc Encoder, caps capture.Capabilities, input *InputOverride) error {
+	_, err := ArgsWithInput(cfg, target, enc, caps, Output{Pipe: true, Format: "h264"}, input)
+	return err
 }
 
 // outputArgs builds the output half of the command line.

@@ -30,11 +30,22 @@ import (
 
 // CurrentSchema is stored in the file so a future version can recognise configs
 // written by an older one.
-const CurrentSchema = 1
+const CurrentSchema = 3
 
 // AppDirName is the folder created inside the operating system's config
 // directory. On Windows that is %AppData%\streamy.
 const AppDirName = "streamy"
+
+const (
+	DefaultSignalingURL = "wss://streamy-signal.thenightserver.workers.dev"
+	DefaultViewerURL    = "https://streamy-viewer.pages.dev/"
+)
+
+// legacyViewerHost is the branch alias the viewer used before production
+// deployments moved to the project's stable pages.dev domain. Cloudflare pins
+// a branch alias to the first preview deployment on that branch, so the alias
+// keeps serving an old build and must not be handed out any more.
+const legacyViewerHost = "master.streamy-viewer.pages.dev"
 
 // The values accepted by Capture.DefaultTarget.
 const (
@@ -58,7 +69,9 @@ const (
 type Config struct {
 	Schema int `json:"schema"`
 
-	LogLevel string `json:"logLevel"`
+	LogLevel      string `json:"logLevel"`
+	SetupComplete bool   `json:"setupComplete"`
+	RunAtStartup  bool   `json:"runAtStartup"`
 
 	Hotkey    Hotkey    `json:"hotkey"`
 	Capture   Capture   `json:"capture"`
@@ -91,6 +104,11 @@ type Capture struct {
 	AutoSwitchTarget bool `json:"autoSwitchTarget"`
 	// CaptureCursor draws the mouse pointer into the video.
 	CaptureCursor bool `json:"captureCursor"`
+	// DesktopAudio captures system render audio, including all apps
+	// routed to that device. When ExcludeDiscordAudio is enabled, Windows
+	// process loopback excludes the Discord desktop client's process tree.
+	DesktopAudio        bool `json:"desktopAudio"`
+	ExcludeDiscordAudio bool `json:"excludeDiscordAudio"`
 }
 
 // Encoding holds the ffmpeg related settings.
@@ -113,11 +131,56 @@ type Encoding struct {
 	ExtraEncoderArgs []string `json:"extraEncoderArgs"`
 }
 
-// Stream holds the WebRTC settings.
+// Stream holds the WebRTC settings and the optional Discord bot notification.
 type Stream struct {
 	MaxViewers  int          `json:"maxViewers"`
 	STUNServers []string     `json:"stunServers"`
 	TURNServers []TURNServer `json:"turnServers"`
+	// Discord configures the local bot that posts the public viewer link.
+	Discord DiscordBot `json:"discord"`
+	// Stack controls the local Discord bot process.
+	Stack LocalBot `json:"stack"`
+}
+
+// DiscordBot configures the local bot notification.
+type DiscordBot struct {
+	// ChannelID is the Discord channel that receives the public viewer link.
+	ChannelID string `json:"channelID"`
+	// NotifyURL and NotifyKey let the bot post or delete the link. Leave
+	// NotifyURL empty to disable notifications.
+	NotifyURL string `json:"notifyURL"`
+	NotifyKey string `json:"notifyKey"`
+}
+
+// LocalBot configures the local Discord bot launcher.
+//
+// The desktop app runs the built-in `streamy bot` subcommand when Script is
+// empty, and stops it again on quit.
+type LocalBot struct {
+	// AutoStart launches the bot together with Streamy.
+	AutoStart bool `json:"autoStart"`
+	// Script is an explicit path to a legacy start-bot.ps1. Empty means use
+	// the built-in Go bot.
+	Script string `json:"script"`
+}
+
+// UnmarshalJSON also reads the old stream.relay notification block. Earlier
+// versions used that object for the Activity relay publisher; only the bot
+// notification fields were kept, so importing them silently upgrades a config.
+func (s *Stream) UnmarshalJSON(data []byte) error {
+	type streamJSON Stream
+	var raw struct {
+		*streamJSON
+		LegacyRelay *DiscordBot `json:"relay"`
+	}
+	raw.streamJSON = (*streamJSON)(s)
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if s.Discord == (DiscordBot{}) && raw.LegacyRelay != nil {
+		s.Discord = *raw.LegacyRelay
+	}
+	return nil
 }
 
 // TURNServer is one relay, used when a direct peer-to-peer path is impossible.
@@ -129,7 +192,8 @@ type TURNServer struct {
 
 // Signaling points at the Cloudflare Worker written in phase 4.
 type Signaling struct {
-	URL string `json:"url"`
+	URL       string `json:"url"`
+	ViewerURL string `json:"viewerURL"`
 }
 
 // Default returns the settings used on first run, and the base that a loaded
@@ -144,9 +208,11 @@ func Default() Config {
 			Picker:  "Ctrl+Shift+F10",
 		},
 		Capture: Capture{
-			DefaultTarget: TargetPrimary,
-			MonitorIndex:  0,
-			CaptureCursor: true,
+			DefaultTarget:       TargetPrimary,
+			MonitorIndex:        0,
+			CaptureCursor:       true,
+			DesktopAudio:        true,
+			ExcludeDiscordAudio: true,
 		},
 		Encoding: Encoding{
 			Encoder:         EncoderAuto,
@@ -163,6 +229,11 @@ func Default() Config {
 				"stun:stun.l.google.com:19302",
 				"stun:stun1.l.google.com:19302",
 			},
+			Stack: LocalBot{AutoStart: true},
+		},
+		Signaling: Signaling{
+			URL:       DefaultSignalingURL,
+			ViewerURL: DefaultViewerURL,
 		},
 	}
 }
@@ -211,6 +282,9 @@ func LoadFrom(path string) (cfg Config, created bool, err error) {
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		cfg = Default()
+		if bundled, ok := bundledDefault(); ok {
+			cfg = bundled
+		}
 		if err := cfg.SaveTo(path); err != nil {
 			return cfg, false, err
 		}
@@ -232,10 +306,55 @@ func LoadFrom(path string) (cfg Config, created bool, err error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, false, fmt.Errorf("parse config: %w", err)
 	}
+	if strings.TrimSpace(cfg.Signaling.URL) == "" {
+		cfg.Signaling.URL = DefaultSignalingURL
+	}
+	if strings.TrimSpace(cfg.Signaling.ViewerURL) == "" {
+		cfg.Signaling.ViewerURL = DefaultViewerURL
+	}
+	// Configs written before the branch change still point at the frozen
+	// alias; rewrite them so shared links reach the current deployment.
+	if isLegacyViewerURL(cfg.Signaling.ViewerURL) {
+		cfg.Signaling.ViewerURL = DefaultViewerURL
+	}
 	if err := cfg.Validate(); err != nil {
 		return cfg, false, err
 	}
 	return cfg, false, nil
+}
+
+// bundledDefault reads config.default.json next to the executable. An installer
+// ships the user's Discord bot and stream settings there, so a fresh install has
+// working notifications instead of the generic defaults. A malformed file is
+// ignored: a bad packaging step must not stop Streamy from starting.
+func bundledDefault() (Config, bool) {
+	self, err := os.Executable()
+	if err != nil {
+		return Config{}, false
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(self), "config.default.json"))
+	if err != nil {
+		return Config{}, false
+	}
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	cfg := Default()
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, false
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, false
+	}
+	return cfg, true
+}
+
+// isLegacyViewerURL reports whether raw points at the branch alias that no
+// longer receives new deployments.
+func isLegacyViewerURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, legacyViewerHost)
 }
 
 // Save writes the config to the default location.
@@ -340,6 +459,23 @@ func (c Config) Validate() error {
 
 	if c.Stream.MaxViewers < 0 {
 		errs = append(errs, errors.New("stream.maxViewers: must not be negative"))
+	} else if c.Stream.MaxViewers > 20 {
+		errs = append(errs, errors.New("stream.maxViewers: must not exceed the Worker hard limit of 20"))
+	}
+	for i, server := range c.Stream.STUNServers {
+		if err := validateICEServerURL(server, "stun", "stuns"); err != nil {
+			errs = append(errs, fmt.Errorf("stream.stunServers[%d]: %w", i, err))
+		}
+	}
+	for i, server := range c.Stream.TURNServers {
+		if len(server.URLs) == 0 {
+			errs = append(errs, fmt.Errorf("stream.turnServers[%d].urls: must contain at least one URL", i))
+		}
+		for j, serverURL := range server.URLs {
+			if err := validateICEServerURL(serverURL, "turn", "turns"); err != nil {
+				errs = append(errs, fmt.Errorf("stream.turnServers[%d].urls[%d]: %w", i, j, err))
+			}
+		}
 	}
 
 	switch strings.ToLower(strings.TrimSpace(c.LogLevel)) {
@@ -352,13 +488,57 @@ func (c Config) Validate() error {
 		parsed, err := url.Parse(u)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("signaling.url: %w", err))
-		} else if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
-			errs = append(errs, fmt.Errorf("signaling.url: scheme must be ws or wss, got %q", parsed.Scheme))
+		} else if (parsed.Scheme != "ws" && parsed.Scheme != "wss") || parsed.Host == "" {
+			errs = append(errs, fmt.Errorf("signaling.url: must be an absolute ws or wss URL, got %q", u))
 		}
+	}
+	if u := strings.TrimSpace(c.Signaling.ViewerURL); u != "" {
+		parsed, err := url.Parse(u)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("signaling.viewerURL: %w", err))
+		} else if (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			errs = append(errs, errors.New("signaling.viewerURL: must be an absolute http or https URL"))
+		}
+	}
+
+	discord := c.Stream.Discord
+	if u := strings.TrimSpace(discord.NotifyURL); u != "" {
+		parsed, err := url.Parse(u)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("stream.discord.notifyURL: %w", err))
+		} else if (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			errs = append(errs, errors.New("stream.discord.notifyURL: must be an absolute http or https URL"))
+		}
+		if strings.TrimSpace(discord.NotifyKey) == "" {
+			errs = append(errs, errors.New("stream.discord.notifyKey: required when notifyURL is set"))
+		}
+	}
+	if id := strings.TrimSpace(discord.ChannelID); id != "" && !discordChannelRe.MatchString(id) {
+		errs = append(errs, errors.New("stream.discord.channelID: must be a Discord channel ID"))
 	}
 
 	return errors.Join(errs...)
 }
+
+func validateICEServerURL(raw string, schemes ...string) error {
+	value := strings.TrimSpace(raw)
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return err
+	}
+	if parsed.Opaque == "" && parsed.Host == "" {
+		return errors.New("must include a server address")
+	}
+	for _, scheme := range schemes {
+		if parsed.Scheme == scheme {
+			return nil
+		}
+	}
+	return fmt.Errorf("scheme must be %s", strings.Join(schemes, " or "))
+}
+
+// discordChannelRe matches a Discord snowflake as accepted by the bot.
+var discordChannelRe = regexp.MustCompile(`^\d{5,32}$`)
 
 // resolutionRe matches "1920x1080" and similar.
 var resolutionRe = regexp.MustCompile(`^(\d{2,5})x(\d{2,5})$`)

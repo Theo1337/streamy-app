@@ -26,3 +26,7 @@ func (r *Resolver) Snapshot(context.Context) (Desktop, error) { return Desktop{}
 func (r *Resolver) Resolve(context.Context, config.Config) (Target, error) {
 	return Target{}, errUnsupported
 }
+
+func (r *Resolver) Windows(context.Context) ([]Window, error) { return nil, errUnsupported }
+
+func Preview(context.Context, Target, int, int) ([]byte, error) { return nil, errUnsupported }

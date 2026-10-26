@@ -29,8 +29,9 @@ func monitorTarget() capture.Target {
 
 func windowTarget() capture.Target {
 	return capture.Target{
-		Kind:   capture.KindWindow,
-		Window: capture.Window{Handle: 42, Title: "Notepad", Rect: capture.Rect{Width: 800, Height: 600}},
+		Kind:    capture.KindWindow,
+		Window:  capture.Window{Handle: 42, Title: "Notepad", Rect: capture.Rect{X: 100, Y: 50, Width: 800, Height: 600}},
+		Monitor: capture.Monitor{Index: 0, DXGIIndex: 0, Bounds: capture.Rect{Width: 1920, Height: 1080}},
 	}
 }
 
@@ -87,7 +88,28 @@ func TestArgsGDigrabMonitorWhenDDAGrabUnavailable(t *testing.T) {
 	}
 }
 
-func TestArgsWindowTargetAlwaysUsesGDigrab(t *testing.T) {
+func TestArgsWindowTargetNeverUsesTheWindowTitle(t *testing.T) {
+	cfg := config.Default()
+
+	args, err := Args(cfg, windowTarget(), EncoderX264, capture.Capabilities{DDAGrab: false}, Output{Path: "out.mp4"})
+	if err != nil {
+		t.Fatalf("Args: %v", err)
+	}
+	line := strings.Join(args, " ")
+
+	// GDI's title= path returns black for GPU-composited windows, so the
+	// window is grabbed as the rectangle it occupies instead.
+	if strings.Contains(line, "title=") {
+		t.Errorf("the window is still selected by title: %s", line)
+	}
+	for _, want := range []string{"-offset_x 100", "-offset_y 50", "-video_size 800x600", "-i desktop"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("args are missing %q\nfull: %s", want, line)
+		}
+	}
+}
+
+func TestArgsWindowTargetCropsDDAGrab(t *testing.T) {
 	cfg := config.Default()
 
 	args, err := Args(cfg, windowTarget(), EncoderX264, capture.Capabilities{DDAGrab: true}, Output{Path: "out.mp4"})
@@ -96,11 +118,11 @@ func TestArgsWindowTargetAlwaysUsesGDigrab(t *testing.T) {
 	}
 	line := strings.Join(args, " ")
 
-	if !strings.Contains(line, "-i title=Notepad") {
-		t.Errorf("the window title is not selected: %s", line)
+	if !strings.Contains(line, "ddagrab=output_idx=0") {
+		t.Errorf("the window's monitor is not duplicated: %s", line)
 	}
-	if strings.Contains(line, "ddagrab") {
-		t.Errorf("ddagrab cannot capture a single window but was used: %s", line)
+	if !strings.Contains(line, "crop=800:600:100:50") {
+		t.Errorf("the window rectangle is not cropped out of the frame: %s", line)
 	}
 }
 

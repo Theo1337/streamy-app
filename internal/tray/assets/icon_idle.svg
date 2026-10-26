@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="66 90 380 380" width="380" height="380" role="img" aria-labelledby="t">
+  <title id="t">Streamy (idle)</title>
+  <g fill="none" stroke="#ffffff" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="96" y="130" width="320" height="210" rx="30" stroke-width="30"/>
+    <path d="M256 340v54M184 400h144" stroke-width="30"/>
+    <path d="M311.5 195.1A68 68 0 0 1 311.5 274.9M200.5 195.1A68 68 0 0 0 200.5 274.9" stroke-width="24"/>
+    <path d="M341.7 168.1A108 108 0 0 1 341.7 301.9M170.3 168.1A108 108 0 0 0 170.3 301.9" stroke-width="24"/>
+  </g>
+  <path d="M254.64 193.01A42 42 0 1 0 293.82 253.29A36 36 0 0 1 254.64 193.01Z" fill="#ffffff" transform="translate(256 235) scale(1.15) translate(-256 -235)"/>
+</svg>

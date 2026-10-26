@@ -3,10 +3,13 @@ package app
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"streamy/internal/capture"
 	"streamy/internal/config"
 	"streamy/internal/pipeline"
 )
@@ -16,13 +19,16 @@ import (
 // takes to stand in for the real pipeline — that is the payoff for keeping the
 // pipeline behind pipeline.Streamer.
 type fakeStreamer struct {
-	mu       sync.Mutex
-	session  pipeline.Session
-	startErr error
-	stopErr  error
-	starts   int
-	stops    int
-	lastReq  pipeline.Request
+	mu         sync.Mutex
+	session    pipeline.Session
+	startErr   error
+	stopErr    error
+	switchErr  error
+	starts     int
+	stops      int
+	switches   int
+	lastReq    pipeline.Request
+	lastTarget capture.Target
 }
 
 func (f *fakeStreamer) Start(_ context.Context, req pipeline.Request) (pipeline.Session, error) {
@@ -41,6 +47,19 @@ func (f *fakeStreamer) Stop(context.Context) error {
 	defer f.mu.Unlock()
 	f.stops++
 	return f.stopErr
+}
+
+func (f *fakeStreamer) SwitchTarget(_ context.Context, target capture.Target) (pipeline.Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.switches++
+	f.lastTarget = target
+	if f.switchErr != nil {
+		return pipeline.Session{}, f.switchErr
+	}
+	session := f.session
+	session.Target = &target
+	return session, nil
 }
 
 func (f *fakeStreamer) counts() (starts, stops int) {
@@ -207,6 +226,89 @@ func TestCopyViewerLinkWithoutStream(t *testing.T) {
 	a.CopyViewerLink()
 	if len(*copied) != 0 {
 		t.Errorf("clipboard = %v, want nothing copied while idle", *copied)
+	}
+}
+
+func TestSwitchWhileSharingKeepsLinkAndUpdatesTarget(t *testing.T) {
+	streamer := &fakeStreamer{session: sharingSession()}
+	a, _ := newTestApp(t, streamer)
+
+	a.ToggleSharing()
+	if got := a.Status(); !got.Sharing {
+		t.Fatalf("status after start = %+v, want sharing", got)
+	}
+
+	target := capture.Target{
+		Kind:   capture.KindWindow,
+		Window: capture.Window{Handle: 42, Title: "Editor"},
+	}
+	if err := a.SwitchSharing(target); err != nil {
+		t.Fatalf("SwitchSharing: %v", err)
+	}
+
+	status := a.Status()
+	if !status.Sharing {
+		t.Fatalf("status after switch = %+v, want still sharing", status)
+	}
+	if status.ViewerURL != testViewerURL {
+		t.Errorf("viewer url = %q, want the original room link %q", status.ViewerURL, testViewerURL)
+	}
+	if status.Target == nil || status.Target.Kind != "window" || status.Target.Handle != "42" {
+		t.Errorf("active target = %+v, want window handle 42", status.Target)
+	}
+	if streamer.switches != 1 {
+		t.Errorf("switch calls = %d, want 1", streamer.switches)
+	}
+}
+
+func TestFindUIExecutable(t *testing.T) {
+	t.Run("built UI beside the tray takes precedence", func(t *testing.T) {
+		root := t.TempDir()
+		binDir := filepath.Join(root, "bin")
+		writeTestFile(t, filepath.Join(binDir, "streamy.exe"))
+		sibling := writeTestFile(t, filepath.Join(binDir, "streamy-ui.exe"))
+
+		if got := findUIExecutable(filepath.Join(binDir, "streamy.exe"), root); got != sibling {
+			t.Fatalf("findUIExecutable() = %q, want sibling %q", got, sibling)
+		}
+	})
+
+	t.Run("go run finds the UI in a module checkout", func(t *testing.T) {
+		root := t.TempDir()
+		writeTestFile(t, filepath.Join(root, "go.mod"))
+		writeTestFile(t, filepath.Join(root, "ui", "main.go"))
+		ui := writeTestFile(t, filepath.Join(root, "out", "bin", "streamy-ui.exe"))
+
+		if got := findUIExecutable(filepath.Join(t.TempDir(), "streamy.exe"), root); got != ui {
+			t.Fatalf("findUIExecutable() = %q, want development build %q", got, ui)
+		}
+	})
+
+	t.Run("does not search arbitrary working directories", func(t *testing.T) {
+		root := t.TempDir()
+		writeTestFile(t, filepath.Join(root, "out", "bin", "streamy-ui.exe"))
+
+		if got := findUIExecutable(filepath.Join(t.TempDir(), "streamy.exe"), root); got != "" {
+			t.Fatalf("findUIExecutable() = %q, want no UI outside a module checkout", got)
+		}
+	})
+}
+
+func writeTestFile(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestRedactViewerURLRemovesRoomAndTURNSecrets(t *testing.T) {
+	got := redactViewerURL("https://watch.example/live?auth=query-secret#room=secret&ice=password")
+	if got != "https://watch.example" {
+		t.Fatalf("redactViewerURL = %q, want only the public viewer origin", got)
 	}
 }
 

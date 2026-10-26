@@ -12,6 +12,7 @@ import (
 
 	"streamy/internal/capture"
 	"streamy/internal/config"
+	"streamy/internal/executil"
 )
 
 // Runner is a running ffmpeg process.
@@ -56,6 +57,9 @@ type StartOptions struct {
 	Capabilities capture.Capabilities
 	// Output is where the stream goes.
 	Output Output
+	// Input optionally replaces the target-derived capture input. Window
+	// capture uses it to feed raw frames from Go over a loopback socket.
+	Input *InputOverride
 	// Logger may be nil.
 	Logger Logger
 	// Stderr, when set, receives ffmpeg's diagnostics live in addition to the
@@ -65,7 +69,7 @@ type StartOptions struct {
 
 // Start builds the command line and starts ffmpeg.
 func Start(ctx context.Context, opts StartOptions) (*Runner, error) {
-	args, err := Args(opts.Config, opts.Target, opts.Encoder, opts.Capabilities, opts.Output)
+	args, err := ArgsWithInput(opts.Config, opts.Target, opts.Encoder, opts.Capabilities, opts.Output, opts.Input)
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +78,7 @@ func Start(ctx context.Context, opts StartOptions) (*Runner, error) {
 	// what must not happen to a process writing an MP4. The context is watched
 	// below and turned into a graceful stop instead.
 	cmd := exec.Command(opts.FFmpeg.Path, args...)
+	executil.HideConsoleWindow(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

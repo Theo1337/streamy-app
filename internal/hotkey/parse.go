@@ -47,6 +47,49 @@ var keyNames, keyDisplay = func() (map[string]hotkey.Key, map[hotkey.Key]string)
 	add("Right", hotkey.KeyRight)
 	add("Up", hotkey.KeyUp)
 	add("Down", hotkey.KeyDown)
+	add("Insert", 0x2D)
+	add("Home", 0x24)
+	add("End", 0x23)
+	add("PageUp", 0x21)
+	add("PageDown", 0x22)
+	add("Backspace", 0x08)
+
+	// Punctuation. Windows identifies these by virtual-key code, not by the
+	// character the layout prints, so Ctrl+\ works the same everywhere.
+	add("\\", 0xDC)
+	add("Backslash", 0xDC)
+	add("/", 0xBF)
+	add("Slash", 0xBF)
+	add(".", 0xBE)
+	add("Period", 0xBE)
+	add(",", 0xBC)
+	add("Comma", 0xBC)
+	add(";", 0xBA)
+	add("Semicolon", 0xBA)
+	add("'", 0xDE)
+	add("Quote", 0xDE)
+	add("[", 0xDB)
+	add("BracketLeft", 0xDB)
+	add("]", 0xDD)
+	add("BracketRight", 0xDD)
+	add("-", 0xBD)
+	add("Minus", 0xBD)
+	// Equal is spelled out because a literal "+" is the shortcut separator.
+	add("Equal", 0xBB)
+	add("=", 0xBB)
+	add("Plus", 0xBB)
+	add("`", 0xC0)
+	add("Backquote", 0xC0)
+
+	// Numpad keys are distinct from the main row.
+	for d := 0; d <= 9; d++ {
+		add(fmt.Sprintf("Numpad%d", d), hotkey.Key(0x60+d))
+	}
+	add("NumpadMultiply", 0x6A)
+	add("NumpadAdd", 0x6B)
+	add("NumpadSubtract", 0x6D)
+	add("NumpadDecimal", 0x6E)
+	add("NumpadDivide", 0x6F)
 
 	// Media keys are handy for a "push to talk to my viewers" style shortcut.
 	add("PlayPause", hotkey.KeyMediaPlayPause)

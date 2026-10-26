@@ -1,13 +1,15 @@
-// Command genicon renders the tray icons used by Streamy.
+// Command genicon renders Streamy's icons from the SVG sources in the repo.
 //
-// It draws the icons with plain image/draw maths instead of shipping binary
-// blobs we cannot inspect, and writes two files per state:
+// Rendering an SVG properly needs a real renderer, so this tool drives headless
+// Chrome or Edge. Everything else — the .ico container, the PNG copies, the
+// per-size downscales — is plain Go, and the generated files are committed, so a
+// normal `go build` needs nothing installed.
 //
-//	icon_idle.ico / icon_idle.png   — shown when nothing is being shared
-//	icon_live.ico / icon_live.png   — shown while a stream is running
+// Sources:
 //
-// .ico is what Windows wants (fyne.io/systray turns the bytes into a temp file
-// and loads it with LoadImage), .png is what macOS and Linux want later on.
+//	ui/assets/app-icon.svg              — the coloured app icon
+//	internal/tray/assets/icon_idle.svg  — white glyph, nothing being shared
+//	internal/tray/assets/icon_live.svg  — white glyph with the red live badge
 //
 // Run it from the module root, then commit the result:
 //
@@ -17,241 +19,221 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
 )
 
-// sizes are the resolutions packed into the .ico. Windows picks the closest one
-// for the notification area, the taskbar and the Alt+Tab switcher.
-var sizes = []int{16, 32, 48}
+// traySizes are the resolutions packed into the tray .ico. Windows picks the
+// closest one for the notification area, the taskbar and the Alt+Tab switcher.
+var traySizes = []int{16, 32, 48}
 
-// supersampling factor: we draw at 4x and box-filter down, which is a cheap way
-// to get anti-aliased edges without a 2D graphics library.
-const supersample = 4
+// appSizes cover the Wails window icon, which Windows also uses for the taskbar
+// and the Alt+Tab switcher, including on high-DPI displays.
+var appSizes = []int{16, 32, 48, 64, 128, 256}
 
-type rgb struct{ r, g, b uint8 }
+// output is one generated file.
+type output struct {
+	source string // SVG path, relative to the module root
+	path   string // destination, relative to the module root
+	ico    []int  // non-nil: write a multi-resolution .ico
+	size   int    // non-zero: write a single square PNG
+}
 
-var (
-	bgIdle = rgb{0x4F, 0x46, 0xE5} // indigo: idle
-	bgLive = rgb{0xDC, 0x26, 0x26} // red: live
-	white  = rgb{0xFF, 0xFF, 0xFF}
-)
+var outputs = []output{
+	// The coloured app icon: window/taskbar icon, settings brand mark, website
+	// favicon and the installer's icon.png (installer/build.ps1 copies the
+	// frontend one into the staging folder).
+	{source: "ui/assets/app-icon.svg", path: "ui/assets/icon_idle.ico", ico: appSizes},
+	{source: "ui/assets/app-icon.svg", path: "ui/frontend/public/icon.png", size: 256},
+	{source: "ui/assets/app-icon.svg", path: "../stream-site/viewer/public/favicon.png", size: 64},
+	{source: "ui/assets/app-icon.svg", path: "../installer/out/stage/icon.png", size: 256},
+
+	// Tray icons: white so they read on the dark Windows notification area.
+	{source: "internal/tray/assets/icon_idle.svg", path: "internal/tray/assets/icon_idle.ico", ico: traySizes},
+	{source: "internal/tray/assets/icon_idle.svg", path: "internal/tray/assets/icon_idle.png", size: 32},
+	{source: "internal/tray/assets/icon_live.svg", path: "internal/tray/assets/icon_live.ico", ico: traySizes},
+	{source: "internal/tray/assets/icon_live.svg", path: "internal/tray/assets/icon_live.png", size: 32},
+}
 
 func main() {
-	out := flag.String("out", filepath.Join("internal", "tray", "assets"), "output directory")
+	root := flag.String("root", ".", "module root (the folder containing ui/ and internal/)")
 	flag.Parse()
 
-	if err := run(*out); err != nil {
+	browser, err := findBrowser()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "genicon:", err)
+		os.Exit(1)
+	}
+
+	if err := run(*root, browser); err != nil {
 		fmt.Fprintln(os.Stderr, "genicon:", err)
 		os.Exit(1)
 	}
 }
 
-func run(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+func run(root, browser string) error {
+	work, err := os.MkdirTemp("", "streamy-genicon-")
+	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(work)
 
-	for _, state := range []struct {
-		name string
-		bg   rgb
-		live bool
-	}{
-		{"idle", bgIdle, false},
-		{"live", bgLive, true},
-	} {
-		ico, err := renderICO(state.bg, state.live, sizes)
+	fmt.Printf("genicon: rendering with %s\n", browser)
+
+	// One render per (source, size): several outputs share the same size, so
+	// this keeps the browser launches down.
+	cache := map[string][]byte{}
+	render := func(source string, size int) ([]byte, error) {
+		key := fmt.Sprintf("%s\x00%d", source, size)
+		if data, ok := cache[key]; ok {
+			return data, nil
+		}
+		data, err := renderPNG(browser, filepath.Join(root, source), work, size)
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("render %s at %dx%d: %w", source, size, size, err)
 		}
-		icoPath := filepath.Join(dir, "icon_"+state.name+".ico")
-		if err := os.WriteFile(icoPath, ico, 0o644); err != nil {
-			return err
+		cache[key] = data
+		return data, nil
+	}
+
+	for _, item := range outputs {
+		destination := filepath.Join(root, item.path)
+		if _, err := os.Stat(filepath.Dir(destination)); err != nil {
+			fmt.Printf("genicon: skipping %s (no %s)\n", item.path, filepath.Dir(destination))
+			continue
 		}
 
-		pngPath := filepath.Join(dir, "icon_"+state.name+".png")
-		if err := writePNG(pngPath, render(32, state.bg, state.live)); err != nil {
+		var data []byte
+		if item.ico != nil {
+			images := make([]*image.NRGBA, len(item.ico))
+			for i, size := range item.ico {
+				raw, err := render(item.source, size)
+				if err != nil {
+					return err
+				}
+				img, err := decodePNG(raw, size)
+				if err != nil {
+					return fmt.Errorf("%s at %dx%d: %w", item.source, size, size, err)
+				}
+				images[i] = img
+			}
+			data = packICO(images, item.ico)
+		} else {
+			raw, err := render(item.source, item.size)
+			if err != nil {
+				return err
+			}
+			if _, err := decodePNG(raw, item.size); err != nil {
+				return fmt.Errorf("%s at %dx%d: %w", item.source, item.size, item.size, err)
+			}
+			data = raw
+		}
+
+		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 			return err
 		}
-		fmt.Printf("wrote %s (%d bytes) and %s\n", icoPath, len(ico), pngPath)
+		if err := os.WriteFile(destination, data, 0o644); err != nil {
+			return err
+		}
+		fmt.Printf("genicon: wrote %s (%d bytes)\n", item.path, len(data))
 	}
 	return nil
 }
 
-// render draws one square icon at the given size.
-func render(size int, bg rgb, live bool) *image.RGBA {
-	w := size * supersample
-
-	// Each supersampled pixel keeps straight (non premultiplied) colour plus
-	// coverage in alpha, so the box filter below can average correctly.
-	type pixel struct {
-		r, g, b uint8
-		a       uint8
+// renderPNG screenshots the SVG at an exact size with a transparent background.
+func renderPNG(browser, svgPath, work string, size int) ([]byte, error) {
+	svg, err := os.ReadFile(svgPath)
+	if err != nil {
+		return nil, err
 	}
-	src := make([]pixel, w*w)
-
-	set := func(x, y int, c rgb) {
-		if x < 0 || y < 0 || x >= w || y >= w {
-			return
-		}
-		src[y*w+x] = pixel{c.r, c.g, c.b, 0xFF}
+	if !bytes.Contains(svg, []byte("<svg")) {
+		return nil, errors.New("not an SVG document")
 	}
 
-	radius := 0.22 * float64(w)
-	for y := 0; y < w; y++ {
-		for x := 0; x < w; x++ {
-			cx, cy := float64(x)+0.5, float64(y)+0.5
-			if !inRoundedRect(cx, cy, 0, 0, float64(w), float64(w), radius) {
-				continue // transparent corner
-			}
-			set(x, y, bg)
-			if inGlyph(cx, cy, float64(w), live) {
-				set(x, y, white)
-			}
-		}
+	// The width/height attributes on the root element win over CSS in some
+	// renderers, so the CSS !important keeps the requested size exact.
+	html := fmt.Sprintf(`<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:0;background:transparent;overflow:hidden}
+svg{display:block;width:%dpx!important;height:%dpx!important}
+</style></head><body>%s</body></html>`, size, size, svg)
+
+	htmlPath := filepath.Join(work, fmt.Sprintf("render-%d.html", size))
+	if err := os.WriteFile(htmlPath, []byte(html), 0o644); err != nil {
+		return nil, err
+	}
+	shotPath := filepath.Join(work, fmt.Sprintf("shot-%d.png", size))
+	_ = os.Remove(shotPath)
+
+	args := []string{
+		"--headless=new",
+		"--disable-gpu",
+		"--hide-scrollbars",
+		"--force-device-scale-factor=1",
+		// 00000000 = fully transparent page background.
+		"--default-background-color=00000000",
+		fmt.Sprintf("--window-size=%d,%d", size, size),
+		"--screenshot=" + shotPath,
+		fileURL(htmlPath),
+	}
+	cmd := exec.Command(browser, args...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("browser exited with %w", err)
 	}
 
-	// Box filter w -> size.
-	dst := image.NewRGBA(image.Rect(0, 0, size, size))
-	n := float64(supersample * supersample)
-	for oy := 0; oy < size; oy++ {
-		for ox := 0; ox < size; ox++ {
-			var ar, ag, ab, aSum float64
-			for y := oy * supersample; y < (oy+1)*supersample; y++ {
-				for x := ox * supersample; x < (ox+1)*supersample; x++ {
-					p := src[y*w+x]
-					aw := float64(p.a) / 255
-					ar += float64(p.r) * aw
-					ag += float64(p.g) * aw
-					ab += float64(p.b) * aw
-					aSum += aw
-				}
-			}
-			alpha := aSum / n
-			var c color.RGBA
-			if aSum > 0 {
-				c = color.RGBA{
-					R: clamp8(ar / aSum),
-					G: clamp8(ag / aSum),
-					B: clamp8(ab / aSum),
-					A: clamp8(alpha * 255),
-				}
-			}
-			dst.SetRGBA(ox, oy, c)
-		}
+	data, err := os.ReadFile(shotPath)
+	if err != nil {
+		return nil, fmt.Errorf("browser did not write a screenshot: %w", err)
 	}
-	return dst
+	return data, nil
 }
 
-// inGlyph reports whether the point (in supersampled pixels, s is the icon
-// width) belongs to the white monitor glyph. The "live" variant adds a filled
-// dot in the middle of the screen.
-func inGlyph(cx, cy, s float64, live bool) bool {
-	// Normalised coordinates make the fractions below readable.
-	x, y := cx/s, cy/s
-
-	// Screen: an outlined rounded rectangle.
-	const (
-		x0, y0, x1, y1 = 0.20, 0.24, 0.80, 0.64
-		border         = 0.075
-	)
-	if inRoundedRectFrac(x, y, x0, y0, x1, y1, 0.06) &&
-		!inRoundedRectFrac(x, y, x0+border, y0+border, x1-border, y1-border, 0.03) {
-		return true
+func fileURL(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
 	}
+	return "file:///" + strings.ReplaceAll(abs, `\`, "/")
+}
 
-	// Stand.
-	if inRectFrac(x, y, 0.44, y1, 0.56, 0.70) {
-		return true
+func decodePNG(data []byte, size int) (*image.NRGBA, error) {
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
 	}
-	if inRectFrac(x, y, 0.33, 0.70, 0.67, 0.76) {
-		return true
+	bounds := img.Bounds()
+	if bounds.Dx() != size || bounds.Dy() != size {
+		return nil, fmt.Errorf("rendered %dx%d, want %dx%d", bounds.Dx(), bounds.Dy(), size, size)
 	}
-
-	if live {
-		// Broadcast dot, snug inside the screen.
-		dx, dy := x-0.50, y-0.44
-		if dx*dx+dy*dy <= 0.13*0.13 {
-			return true
+	// Convert once, so the ICO writer gets straight (non-premultiplied) alpha
+	// and anti-aliased edges keep their colour.
+	nrgba := image.NewNRGBA(image.Rect(0, 0, size, size))
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			nrgba.Set(x, y, color.NRGBAModel.Convert(img.At(bounds.Min.X+x, bounds.Min.Y+y)))
 		}
 	}
-	return false
+	return nrgba, nil
 }
 
-func inRectFrac(x, y, x0, y0, x1, y1 float64) bool {
-	return x >= x0 && x <= x1 && y >= y0 && y <= y1
-}
-
-func inRoundedRectFrac(x, y, x0, y0, x1, y1, r float64) bool {
-	return inRoundedRect(x, y, x0, y0, x1, y1, r)
-}
-
-// inRoundedRect is the classic "point in rounded rectangle" test: inside the
-// inner rectangle, or within r of one of the four corner centres.
-func inRoundedRect(px, py, x0, y0, x1, y1, r float64) bool {
-	if px < x0 || px > x1 || py < y0 || py > y1 {
-		return false
-	}
-	if r <= 0 {
-		return true
-	}
-	ix0, iy0, ix1, iy1 := x0+r, y0+r, x1-r, y1-r
-	// Straight edges.
-	if px >= ix0 && px <= ix1 {
-		return true
-	}
-	if py >= iy0 && py <= iy1 {
-		return true
-	}
-	// Corners: nearest centre.
-	cx := ix0
-	if px > ix1 {
-		cx = ix1
-	}
-	cy := iy0
-	if py > iy1 {
-		cy = iy1
-	}
-	dx, dy := px-cx, py-cy
-	return dx*dx+dy*dy <= r*r
-}
-
-func clamp8(v float64) uint8 {
-	switch {
-	case v <= 0:
-		return 0
-	case v >= 255:
-		return 255
-	default:
-		return uint8(v + 0.5)
-	}
-}
-
-func writePNG(path string, img *image.RGBA) error {
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return err
-	}
-	return os.WriteFile(path, buf.Bytes(), 0o644)
-}
-
-// renderICO packs one BMP-format image per size into an .ico container.
+// packICO packs one BMP-format image per size into an .ico container.
 //
 // The ICO file is: ICONDIR, then one 16-byte ICONDIRENTRY per image, then the
 // raw payloads. Each payload is a BITMAPINFOHEADER followed by bottom-up BGRA
 // rows and a 1bpp AND mask (all zeroes here — the alpha channel does the real
 // transparency work).
-func renderICO(bg rgb, live bool, sizes []int) ([]byte, error) {
-	images := make([]*image.RGBA, len(sizes))
-	for i, s := range sizes {
-		images[i] = render(s, bg, live)
-	}
-
+func packICO(images []*image.NRGBA, sizes []int) []byte {
 	payloads := make([][]byte, len(images))
 	for i, img := range images {
 		payloads[i] = bmpPayload(img)
@@ -271,11 +253,9 @@ func renderICO(bg rgb, live bool, sizes []int) ([]byte, error) {
 
 	// ICONDIRENTRY
 	offset := 6 + 16*len(images)
-	for i, img := range images {
-		w := img.Bounds().Dx()
-		h := img.Bounds().Dy()
-		buf.WriteByte(byte(w % 256)) // 0 means 256
-		buf.WriteByte(byte(h % 256))
+	for i, size := range sizes {
+		buf.WriteByte(byte(size % 256)) // 0 means 256
+		buf.WriteByte(byte(size % 256))
 		buf.WriteByte(0)  // palette size
 		buf.WriteByte(0)  // reserved
 		write(uint16(1))  // colour planes
@@ -288,10 +268,10 @@ func renderICO(bg rgb, live bool, sizes []int) ([]byte, error) {
 	for _, p := range payloads {
 		buf.Write(p)
 	}
-	return buf.Bytes(), nil
+	return buf.Bytes()
 }
 
-func bmpPayload(img *image.RGBA) []byte {
+func bmpPayload(img *image.NRGBA) []byte {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 
@@ -319,7 +299,7 @@ func bmpPayload(img *image.RGBA) []byte {
 	// XOR image: BGRA, bottom row first.
 	for y := h - 1; y >= 0; y-- {
 		for x := 0; x < w; x++ {
-			c := img.RGBAAt(b.Min.X+x, b.Min.Y+y)
+			c := img.NRGBAAt(b.Min.X+x, b.Min.Y+y)
 			buf.Write([]byte{c.B, c.G, c.R, c.A})
 		}
 	}
@@ -329,4 +309,48 @@ func bmpPayload(img *image.RGBA) []byte {
 	buf.Write(make([]byte, rowBytes*h))
 
 	return buf.Bytes()
+}
+
+// findBrowser locates a Chromium build that can take headless screenshots.
+// STREAMY_BROWSER overrides the search.
+func findBrowser() (string, error) {
+	if explicit := strings.TrimSpace(os.Getenv("STREAMY_BROWSER")); explicit != "" {
+		return explicit, nil
+	}
+
+	names := []string{"chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "msedge", "microsoft-edge"}
+	for _, name := range names {
+		if path, err := exec.LookPath(name); err == nil {
+			return path, nil
+		}
+	}
+
+	var candidates []string
+	switch runtime.GOOS {
+	case "windows":
+		for _, base := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)"), os.Getenv("LOCALAPPDATA")} {
+			if base == "" {
+				continue
+			}
+			candidates = append(candidates,
+				filepath.Join(base, "Google", "Chrome", "Application", "chrome.exe"),
+				filepath.Join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+			)
+		}
+	case "darwin":
+		candidates = append(candidates,
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+		)
+	default:
+		candidates = append(candidates, "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/microsoft-edge")
+	}
+
+	sort.Strings(candidates)
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("no Chrome or Edge found; install one or set STREAMY_BROWSER to its executable")
 }

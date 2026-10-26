@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="t">
+  <title id="t">Streamy</title>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#343a9a"/>
+      <stop offset="1" stop-color="#0d1033"/>
+    </linearGradient>
+    <radialGradient id="glow" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#ffe9a8" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#ffe9a8" stop-opacity="0"/>
+    </radialGradient>
+    <path id="spark" d="M0-12C1.5-4 4-1.5 12 0 4 1.5 1.5 4 0 12-1.5 4-4 1.5-12 0-4-1.5-1.5-4 0-12Z"/>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#sky)"/>
+
+  <!-- stars -->
+  <g fill="#fff">
+    <use href="#spark" x="148" y="82"/>
+    <use href="#spark" x="392" y="68" transform="translate(392 68) scale(.7) translate(-392 -68)"/>
+    <use href="#spark" x="428" y="440" transform="translate(428 440) scale(.8) translate(-428 -440)"/>
+    <circle cx="84" cy="450" r="5" opacity=".8"/>
+    <circle cx="300" cy="64" r="4" opacity=".7"/>
+    <circle cx="452" cy="132" r="4" opacity=".6"/>
+    <circle cx="62" cy="108" r="3.5" opacity=".6"/>
+  </g>
+
+  <!-- monitor -->
+  <rect x="96" y="130" width="320" height="210" rx="30" fill="#11143f" stroke="#d5dbff" stroke-width="26" stroke-linejoin="round"/>
+  <path d="M256 340v54M184 400h144" fill="none" stroke="#d5dbff" stroke-width="26" stroke-linecap="round"/>
+
+  <!-- moon + broadcast waves -->
+  <circle cx="256" cy="235" r="74" fill="url(#glow)"/>
+  <path d="M254.64 193.01A42 42 0 1 0 293.82 253.29A36 36 0 0 1 254.64 193.01Z" fill="#ffe9a8"/>
+  <g fill="none" stroke="#9fb4ff" stroke-linecap="round">
+    <path d="M311.5 195.1A68 68 0 0 1 311.5 274.9M200.5 195.1A68 68 0 0 0 200.5 274.9" stroke-width="20"/>
+    <path d="M341.7 168.1A108 108 0 0 1 341.7 301.9M170.3 168.1A108 108 0 0 0 170.3 301.9" stroke-width="20" opacity=".6"/>
+  </g>
+</svg>
