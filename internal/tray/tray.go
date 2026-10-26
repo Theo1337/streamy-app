@@ -51,6 +51,7 @@ type Controller interface {
 	ToggleSharing()
 	OpenSettings()
 	CopyViewerLink()
+	CheckForUpdates()
 	Quit()
 }
 
@@ -71,11 +72,12 @@ type Tray struct {
 	title  string
 	opts   Options
 
-	mStatus    *systray.MenuItem
-	mStartStop *systray.MenuItem
-	mSettings  *systray.MenuItem
-	mCopyLink  *systray.MenuItem
-	mQuit      *systray.MenuItem
+	mStatus       *systray.MenuItem
+	mStartStop    *systray.MenuItem
+	mSettings     *systray.MenuItem
+	mCopyLink     *systray.MenuItem
+	mCheckUpdates *systray.MenuItem
+	mQuit         *systray.MenuItem
 
 	// mu guards ready: menu items and the icon only exist after systray.Run has
 	// called onReady, but Refresh and Quit may be called before that.
@@ -172,6 +174,7 @@ func (t *Tray) onReady() {
 	t.mStartStop = systray.AddMenuItem("Start sharing", "Start or stop capturing the screen")
 	t.mSettings = systray.AddMenuItem("Open settings\u2026", "Hotkey, encoder, servers")
 	t.mCopyLink = systray.AddMenuItem("Copy viewer link", "Copy the link your viewers should open")
+	t.mCheckUpdates = systray.AddMenuItem("Check for updates\u2026", "Check for a new version")
 	systray.AddSeparator()
 	t.mQuit = systray.AddMenuItem("Quit", "Stop sharing and exit")
 
@@ -206,6 +209,8 @@ func (t *Tray) clickLoop() {
 			t.ctrl.OpenSettings()
 		case <-t.mCopyLink.ClickedCh:
 			t.ctrl.CopyViewerLink()
+		case <-t.mCheckUpdates.ClickedCh:
+			t.ctrl.CheckForUpdates()
 		case <-t.mQuit.ClickedCh:
 			// Quit the app, not just the tray: the app stops the stream and
 			// then closes the tray, so no resource is left behind.

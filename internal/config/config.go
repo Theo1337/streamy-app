@@ -78,6 +78,7 @@ type Config struct {
 	Encoding  Encoding  `json:"encoding"`
 	Stream    Stream    `json:"stream"`
 	Signaling Signaling `json:"signaling"`
+	Update    Update    `json:"update"`
 }
 
 // Hotkey holds the global shortcuts. Both are parsed by internal/hotkey, e.g.
@@ -196,6 +197,16 @@ type Signaling struct {
 	ViewerURL string `json:"viewerURL"`
 }
 
+// Update controls automatic update checking from GitHub releases.
+type Update struct {
+	// Enabled turns on periodic update checks.
+	Enabled bool `json:"enabled"`
+	// Repo is the GitHub repository in "owner/repo" format.
+	Repo string `json:"repo"`
+	// CheckIntervalDays is how often to check for updates (0 = default 7 days).
+	CheckIntervalDays int `json:"checkIntervalDays"`
+}
+
 // Default returns the settings used on first run, and the base that a loaded
 // file is decoded on top of.
 func Default() Config {
@@ -234,6 +245,11 @@ func Default() Config {
 		Signaling: Signaling{
 			URL:       DefaultSignalingURL,
 			ViewerURL: DefaultViewerURL,
+		},
+		Update: Update{
+			Enabled:           true,
+			Repo:              "Theo1337/streamy-app",
+			CheckIntervalDays: 7,
 		},
 	}
 }
@@ -498,6 +514,17 @@ func (c Config) Validate() error {
 			errs = append(errs, fmt.Errorf("signaling.viewerURL: %w", err))
 		} else if (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
 			errs = append(errs, errors.New("signaling.viewerURL: must be an absolute http or https URL"))
+		}
+	}
+
+	if c.Update.Enabled {
+		if strings.TrimSpace(c.Update.Repo) == "" {
+			errs = append(errs, errors.New("update.repo: must not be empty when update is enabled"))
+		} else if !strings.Contains(c.Update.Repo, "/") {
+			errs = append(errs, errors.New("update.repo: must be in 'owner/repo' format"))
+		}
+		if c.Update.CheckIntervalDays < 0 {
+			errs = append(errs, errors.New("update.checkIntervalDays: must not be negative"))
 		}
 	}
 

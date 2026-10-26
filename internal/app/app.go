@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"streamy/internal/sound"
 	"streamy/internal/stack"
 	"streamy/internal/tray"
+	"streamy/internal/update"
 	"streamy/internal/version"
 )
 
@@ -83,6 +85,7 @@ type App struct {
 	pickerHotkeys *hotkey.Manager
 	tray          *tray.Tray
 	stack         *stack.Manager
+	updateChecker *update.Checker
 
 	// mu guards the state below. Everything that touches them goes through a
 	// short critical section and then calls refresh() outside of it, because
@@ -130,6 +133,12 @@ func New(opts Options) (*App, error) {
 		timeout = 10 * time.Second
 	}
 
+	// Initialize update checker if enabled
+	var updateChecker *update.Checker
+	if opts.Config.Update.Enabled && strings.TrimSpace(opts.Config.Update.Repo) != "" {
+		updateChecker = update.NewChecker(opts.Config.Update.Repo)
+	}
+
 	a := &App{
 		logger:          logger,
 		cfg:             opts.Config,
@@ -138,6 +147,7 @@ func New(opts Options) (*App, error) {
 		hotkeys:         hotkey.NewManager(logger),
 		pickerHotkeys:   hotkey.NewManager(logger),
 		stack:           stack.New(logger, opts.Config.Stream.Stack, opts.Config.Stream.Discord.NotifyURL, opts.Config.Stream.Discord.NotifyKey),
+		updateChecker:   updateChecker,
 		state:           StateIdle,
 		copyToClipboard: clipboard.WriteText,
 		timeout:         timeout,
@@ -233,6 +243,11 @@ func (a *App) onReady() error {
 		a.stack.Start()
 	}
 
+	// Start update checker if enabled
+	if a.updateChecker != nil {
+		go a.checkForUpdates()
+	}
+
 	if err := a.registerHotkeys(a.cfg.Hotkey); err != nil {
 		a.logger.Error("global hotkeys unavailable", "error", err)
 		a.notify("Hotkey unavailable", fmt.Sprintf("%v\nChange the shortcuts in:\n%s", err, a.cfgPath))
@@ -304,6 +319,68 @@ func (a *App) watchBotIdle() {
 		}
 		cancel()
 	}
+}
+
+// checkForUpdates checks for updates on startup and then periodically.
+func (a *App) checkForUpdates() {
+	// Initial check after a short delay to not slow down startup
+	select {
+	case <-a.quitCh:
+		return
+	case <-time.After(5 * time.Second):
+	}
+
+	a.performUpdateCheck()
+
+	// Then check periodically based on config interval
+	intervalDays := a.cfg.Update.CheckIntervalDays
+	if intervalDays <= 0 {
+		intervalDays = 7
+	}
+	ticker := time.NewTicker(time.Duration(intervalDays) * 24 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.quitCh:
+			return
+		case <-ticker.C:
+			a.performUpdateCheck()
+		}
+	}
+}
+
+// performUpdateCheck runs a single update check and notifies if update available.
+func (a *App) performUpdateCheck() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	result, err := a.updateChecker.Check(ctx)
+	if err != nil {
+		a.logger.Debug("update check failed", "error", err)
+		return
+	}
+
+	if !result.UpdateAvailable {
+		a.logger.Debug("no update available", "current", result.CurrentVersion, "latest", result.LatestVersion)
+		return
+	}
+
+	a.logger.Info("update available", "current", result.CurrentVersion, "latest", result.LatestVersion)
+
+	// Notify user about update
+	message := fmt.Sprintf("Version %s is available (you have %s).", result.LatestVersion, result.CurrentVersion)
+	if result.DownloadURL != "" && result.DownloadURL != result.ReleaseURL {
+		message += "\nClick to download the installer."
+	} else {
+		message += "\nClick to view the release page."
+	}
+
+	a.notify("Streamy update available", message)
+
+	// Store the download URL for the notification click handler
+	// We'll need to add a way to handle notification clicks
+	_ = result.DownloadURL
 }
 
 // Status implements tray.Controller.
@@ -725,6 +802,58 @@ func (a *App) CopyViewerLink() {
 		return
 	}
 	a.notify("Link copied", url)
+}
+
+// CheckForUpdates implements tray.Controller.
+func (a *App) CheckForUpdates() {
+	if a.updateChecker == nil {
+		a.notify("Update check unavailable", "Auto-update is not configured. Set a GitHub repo in settings to enable.")
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		result, err := a.updateChecker.Check(ctx)
+		if err != nil {
+			a.logger.Error("update check failed", "error", err)
+			a.notify("Update check failed", err.Error())
+			return
+		}
+
+		if !result.UpdateAvailable {
+			a.notify("No updates", fmt.Sprintf("You are on the latest version (%s).", result.CurrentVersion))
+			return
+		}
+
+		// Update available - open the download URL in the browser
+		downloadURL := result.DownloadURL
+		if downloadURL == "" {
+			downloadURL = result.ReleaseURL
+		}
+
+		if err := openInBrowser(downloadURL); err != nil {
+			a.logger.Error("could not open download URL", "error", err, "url", downloadURL)
+			a.notify("Could not open download page", fmt.Sprintf("Please visit: %s", downloadURL))
+			return
+		}
+
+		a.notify("Update available", fmt.Sprintf("Opening download for version %s...", result.LatestVersion))
+	}()
+}
+
+// openInBrowser opens a URL in the default browser.
+func openInBrowser(url string) error {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	} else if runtime.GOOS == "darwin" {
+		cmd = exec.Command("open", url)
+	} else {
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
 }
 
 // Quit implements tray.Controller and is the single "please stop" entry point.
