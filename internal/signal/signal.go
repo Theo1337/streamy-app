@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"path"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -205,6 +207,25 @@ func ConnectViewer(ctx context.Context, endpoint, room, token string) (*WebSocke
 	return client, nil
 }
 
+// dialContext returns a NetDialContext that prefers IPv4 to avoid IPv6 timeouts
+// when connecting to Cloudflare Workers (which may have IPv6 routing issues).
+func dialContext() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Force IPv4 by resolving the host to IPv4 addresses only.
+		// This avoids IPv6 routing issues with Cloudflare Workers.
+		if runtime.GOOS == "windows" {
+			// On Windows, explicitly use tcp4 to prefer IPv4
+			return d.DialContext(ctx, "tcp4", addr)
+		}
+		// On other platforms, use the default dialer which typically tries IPv4 first
+		return d.DialContext(ctx, network, addr)
+	}
+}
+
 func (c *WebSocket) connect(ctx context.Context, room, token string, role Role, maxViewers int, identityToken string, iceServers []ICEServer) error {
 	if c.conn != nil {
 		return errors.New("signaling client is already connected")
@@ -216,7 +237,10 @@ func (c *WebSocket) connect(ctx context.Context, room, token string, role Role, 
 	if err != nil {
 		return err
 	}
-	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		NetDialContext:   dialContext(),
+	}
 	conn, response, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		if response != nil {

@@ -76,6 +76,17 @@ bound only to `127.0.0.1`. The tray itself imports no Wails or frontend runtime.
 The picker can start a specific display/window, and the hotkey settings can
 toggle sharing or open the picker.
 
+### Live indicator
+
+While a stream is live, Streamy can draw a small blinking red dot in one of the
+four corners of the primary display. It is a hand-written layered Win32 window
+(`internal/liveindicator`): always on top, click-through, never takes focus, and
+kept out of screen capture with `WDA_EXCLUDEFROMCAPTURE`, so only the streamer
+sees it. It is created only when the first stream starts; disable it or change
+its corner in **Settings → General → Live indicator**. As with any normal
+desktop window, a truly exclusive fullscreen DirectX app can still cover it;
+borderless fullscreen and windowed apps cannot.
+
 ### Discord bot notification
 
 | Requirement | Where |
@@ -428,6 +439,10 @@ are read from phase 3 onwards.
     "autoSwitchTarget": false,
     "captureCursor": true
   },
+  "indicator": {
+    "enabled": true,
+    "position": "top-right"
+  },
   "encoding": {
     "encoder": "auto",
     "ffmpegPath": "",
@@ -466,6 +481,9 @@ Notes:
 - **A bad value is rejected with a message** instead of failing halfway through
   a stream. `Config.Validate()` also caps viewers at the Worker limit and checks
   that STUN/TURN URLs use the right schemes.
+- **The live indicator** is enabled by default in the top right corner. Valid
+  positions are `top-right`, `top-left`, `bottom-right` and `bottom-left`; it is
+  shown only while a stream is live.
 - **Viewer count** can be `0` (use the Worker maximum) or `1`–`20`. The Worker
   still enforces its own hard cap.
 - **TURN settings** are shared in the viewer link fragment so the browser can

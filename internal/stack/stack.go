@@ -34,10 +34,11 @@ const (
 // Manager is safe to call from several goroutines. Start is idempotent and
 // Stop only stops a bot that this process started (or adopted after a restart).
 type Manager struct {
-	logger *slog.Logger
-	script string
-	port   int
-	apiKey string
+	logger       *slog.Logger
+	script       string
+	publishToken string
+	port         int
+	apiKey       string
 
 	mu         sync.Mutex
 	started    bool
@@ -54,12 +55,38 @@ func New(logger *slog.Logger, settings config.LocalBot, notifyURL, notifyKey str
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{
-		logger: logger,
-		script: strings.TrimSpace(settings.Script),
-		port:   portFromNotifyURL(notifyURL),
-		apiKey: strings.TrimSpace(notifyKey),
+	script := strings.TrimSpace(settings.Script)
+	if script == "" {
+		script = defaultActivityScript()
 	}
+	return &Manager{
+		logger:       logger,
+		script:       script,
+		publishToken: strings.TrimSpace(settings.PublishToken),
+		port:         portFromNotifyURL(notifyURL),
+		apiKey:       strings.TrimSpace(notifyKey),
+	}
+}
+
+// defaultActivityScript finds the packaged Activity launcher beside the app.
+// A development checkout normally sets stack.script explicitly; an installed
+// build ships stack\start-stack.ps1, and this makes it work without requiring
+// the user to edit config.json.
+func defaultActivityScript() string {
+	self, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	candidates := []string{
+		filepath.Join(filepath.Dir(self), "stack", "start-stack.ps1"),
+		filepath.Join(filepath.Dir(self), "start-stack.ps1"),
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
 }
 
 // Start launches the bot in the background. It is safe to call repeatedly.
@@ -252,7 +279,11 @@ func (m *Manager) runScript(script string, generation int) {
 	m.mu.Unlock()
 	defer cancel()
 
-	err := m.exec(ctx, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Hidden")
+	args := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Hidden"}
+	if m.publishToken != "" {
+		args = append(args, "-PublishToken", m.publishToken)
+	}
+	err := m.exec(ctx, args...)
 	m.finish(generation, err, err == nil)
 	if err != nil {
 		m.logger.Warn("the local Discord bot did not start", "error", err)
@@ -269,6 +300,12 @@ func (m *Manager) finish(generation int, err error, running bool) {
 	}
 	m.running = running
 	m.err = err
+	if !running {
+		// The child is gone. Clear started so the next Start (for example when
+		// the user begins a new stream) relaunches it instead of leaving the
+		// manager stuck after a failed startup or a crash.
+		m.started = false
+	}
 }
 
 func (m *Manager) exec(ctx context.Context, args ...string) error {

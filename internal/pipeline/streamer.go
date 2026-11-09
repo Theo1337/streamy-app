@@ -46,8 +46,18 @@ type Request struct {
 	Target *capture.Target
 	// IdentityToken is a Worker-signed Discord host identity.
 	IdentityToken string
+	// UserID is the Discord user ID, used to resolve the voice channel the
+	// streamer is currently in for Discord Activity.
+	UserID string
 	// UserName is the Discord display name the bot puts in its message.
 	UserName string
+	// OnViewerWatching is called once per viewer when their WebRTC connection
+	// is established, meaning video is actually reaching them. It runs on its
+	// own goroutine and must not block. Optional.
+	OnViewerWatching func()
+	// OnViewerLeft is called when a viewer that was watching disconnects.
+	// It runs on the signaling goroutine, so it must not block. Optional.
+	OnViewerLeft func()
 }
 
 // Session describes a running pipeline.
